@@ -47,7 +47,8 @@ async function run(readyAt, maxAttempts, timeoutMs, pattern = '\\S') {
   assert.match(late.result.body,/page.webp/);
   const absent=await run(Infinity,3,20000);
   assert.equal(absent.result.success,false,'unmet selector cannot return initial HTML as success');
-  assert.equal(absent.result.body,'');
+  assert.match(absent.result.body,/waiting/,'keep the page so challenge and login gates stay detectable');
+  assert.equal(absent.result.statusCode,200,'a loaded page is not reported as a network failure');
   assert.equal(absent.polls,3,'respect the requested attempt count');
   const capped=await run(Infinity,999,120000);
   assert.equal(capped.result.success,false);
@@ -55,5 +56,10 @@ async function run(readyAt, maxAttempts, timeoutMs, pattern = '\\S') {
   const timeout=await run(Infinity,120,3000);
   assert.equal(timeout.result.success,false);
   assert.equal(timeout.now,3000,'requested deadline remains enforced');
-  console.log('PASS comic browser wait: late images, unmet selector and hard deadline');
+  const invalid=await run(Infinity,40,20000,'(');
+  assert.equal(invalid.result.success,false);
+  assert.match(invalid.result.error,/正则/);
+  assert.equal(invalid.polls,0,'an invalid pattern fails before loading the page');
+  assert.equal(invalid.now,0);
+  console.log('PASS comic browser wait: late images, unmet selector, invalid pattern and hard deadline');
 })().catch(error=>{console.error(error);process.exitCode=1;});
