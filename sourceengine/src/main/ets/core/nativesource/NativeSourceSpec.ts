@@ -135,6 +135,8 @@ export interface NativeExploreSpec extends NativeStageSpec {
 export interface NativeDetailSpec extends NativeStageSpec {
   /** 存入书籍变量，后续阶段通过 book.vars.名称 读取。 */
   keep?: Record<string, NativeValue>;
+  /** 主请求之后的附加请求，例如作者在一个接口、最新章节在另一个接口。 */
+  fetch?: Record<string, NativeFetchSpec>;
 }
 
 export interface NativeTocSpec extends NativeStageSpec {

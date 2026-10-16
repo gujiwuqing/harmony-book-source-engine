@@ -271,6 +271,26 @@ try {
   const info = await runner.detail(book);
   equal([info.author, info.intro, info.tocUrl], ['土豆', '暂无简介', 'https://api.example.com/book?book_id=11'], '详情字段');
   equal(info.keep, { bookId: '11' }, '书籍变量');
+
+  // 详情附加请求：作者在详情接口、最新章节在另一个接口；请求失败或 when 为假时变量为 null。
+  const detailFetch = JSON.parse(JSON.stringify(sample));
+  detailFetch.detail.fetch = {
+    units: { url: '{{server}}/units?book_id={{d.book_id}}&order=2' },
+    missing: { url: '{{server}}/missing' },
+    skipped: { when: '= false', url: '{{server}}/units' }
+  };
+  detailFetch.detail.fields.lastChapter = "= str(units.data[0].title) + (missing ? 'x' : '') + (skipped ? 'y' : '')";
+  equal(NativeSourceSpec.validate(NativeSourceSpec.fromObject(JSON.parse(JSON.stringify(detailFetch)))), [],
+    '详情附加请求通过校验');
+  responses['/units'] = { data: [{ title: '第九十九章' }] };
+  const detailFetchHost = createTestHost(JsonPathEvaluator, respond);
+  const fetchedInfo = await new NativeSourceRunner(NativeSourceSpec.fromObject(detailFetch), detailFetchHost,
+    { server: 'https://api.example.com' }).detail(book);
+  equal([fetchedInfo.author, fetchedInfo.lastChapter], ['土豆', '第九十九章'], '详情同时取主接口与附加接口');
+  equal(detailFetchHost.requests.map((r) => r.url.replace('https://api.example.com', '')),
+    [book.bookUrl.replace('https://api.example.com', ''), '/units?book_id=11&order=2', '/missing'],
+    '附加请求按声明顺序发出，when 为假的不发');
+  delete responses['/units'];
   book.tocUrl = info.tocUrl;
   book.vars = info.keep;
 

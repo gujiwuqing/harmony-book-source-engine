@@ -426,6 +426,7 @@ export class NativeSourceRunner {
     const stage = this.definition.detail || {};
     const scope = (await this.baseScope()).set('book', book);
     const loaded = await this.loadStage(stage, scope, book.bookUrl, '详情');
+    await this.runExtraFetches(this.definition.detail ? this.definition.detail.fetch : undefined, loaded);
     const record = this.readBook(stage.fields || {}, loaded.scope, loaded.baseUrl, 'detail');
     if (!record.bookUrl) record.bookUrl = book.bookUrl;
     const keep = this.definition.detail ? this.definition.detail.keep : undefined;
@@ -548,7 +549,7 @@ export class NativeSourceRunner {
       const loaded = await this.loadStage(pageStage, scope.child().set('__url', nextUrl), chapter.url, '正文');
       if (!firstBase) firstBase = loaded.baseUrl;
       if (!firstPage) firstPage = loaded;
-      await this.runExtraFetches(stage, loaded);
+      await this.runExtraFetches(stage.fetch, loaded);
       if (kind === 'audio' || kind === 'video') {
         const audio = NativeExpr.toText(this.first(this.value(kind === 'audio' ? stage.audio : stage.video,
           loaded.scope, false, `content.${kind}`))).trim();
@@ -843,8 +844,8 @@ export class NativeSourceRunner {
     return value;
   }
 
-  private async runExtraFetches(stage: NativeContentSpec, loaded: StagePage): Promise<void> {
-    const fetches = stage.fetch;
+  private async runExtraFetches(fetches: Record<string, NativeFetchSpec> | undefined,
+    loaded: StagePage): Promise<void> {
     if (!fetches) return;
     for (const name of Object.keys(fetches)) {
       const spec: NativeFetchSpec = fetches[name];
