@@ -65,6 +65,12 @@ try {
   equal(ev('len(range(3))'), 3, 'range');
   equal(expr.render('{{vars.mode}}/p{{page}}?k={{urlencode(key)}}', scope), '听书/p3?k=%E6%96%97%E7%A0%B4', '模板');
   equal(expr.render('{{ tojson({a: 1}) }}', scope), '{"a":1}', '模板内以对象字面量结尾');
+  equal(expr.render('{{ tojson({a: 1})}}', scope), '{"a":1}', '对象字面量与结束的 }} 相连');
+  equal(expr.render('{{tojson({a: {b: page}})}}', scope), '{"a":{"b":3}}', '嵌套对象字面量');
+  equal(expr.render('{"page":{{page}}}', scope), '{"page":3}', '模板外的 JSON 结尾花括号原样保留');
+  equal(expr.render('{"a":{"b":{{page}}},"k":"{{key}}"}', scope), '{"a":{"b":3},"k":"斗破"}', '嵌在多层 JSON 里的模板');
+  equal(expr.render("{{ '}}' + page }}", scope), '}}3', '字符串里的 }} 不结束模板');
+  equal(NativeExpr.checkTemplate('{"page":{{page}}}'), '', '模板外的 JSON 通过语法检查');
 
   const mustFail = (source, hint) => {
     assertions++;
@@ -264,6 +270,41 @@ try {
   equal(runHost.requests[runHost.requests.length - 1].url, 'https://api.example.com/list?c=1&page=4', '动态分类按页渲染');
   equal(listed[0].bookUrl, 'https://api.example.com/detail?book_id=l1', '动态分类结果');
 
+  // 静态分类各自的请求方法与请求体；请求方法可以写表达式。
+  const methodMenus = JSON.parse(JSON.stringify(sample));
+  methodMenus.explore.body = '{"from":"explore"}';
+  methodMenus.explore.menus = [
+    { title: '沿用', url: '{{server}}/rank?page={{page}}' },
+    { title: 'GET 不带体', url: '{{server}}/rank?page={{page}}', method: 'get', body: '' },
+    { title: '按页切换', url: '{{server}}/rank', method: "= page > 1 ? 'PUT' : 'POST'", body: '= tojson({page: page})' },
+    { title: '坏方法', url: '{{server}}/rank', method: '= "G T"' }
+  ];
+  equal(NativeSourceSpec.validate(NativeSourceSpec.fromObject(JSON.parse(JSON.stringify(methodMenus)))), [],
+    '分类的 method/body 通过校验');
+  const methodHost = createTestHost(JsonPathEvaluator, respond);
+  const methodRunner = new NativeSourceRunner(NativeSourceSpec.fromObject(methodMenus), methodHost,
+    { server: 'https://api.example.com' });
+  const methodTargets = (await methodRunner.exploreMenus()).map((m) => m.target);
+  const lastRequest = () => {
+    const r = methodHost.requests[methodHost.requests.length - 1];
+    return [r.method, r.body];
+  };
+  await methodRunner.explore(methodTargets[0], 1);
+  equal(lastRequest(), ['POST', '{"from":"explore"}'], '不写时沿用 explore 的请求体，默认 POST');
+  await methodRunner.explore(methodTargets[1], 1);
+  equal(lastRequest(), ['GET', ''], '分类改为 GET，body 空串表示不带请求体');
+  await methodRunner.explore(methodTargets[2], 1);
+  equal(lastRequest(), ['POST', '{"page":1}'], '请求方法表达式（第 1 页）');
+  await methodRunner.explore(methodTargets[2], 2);
+  equal(lastRequest(), ['PUT', '{"page":2}'], '请求方法表达式（第 2 页）');
+  let badMethod = '';
+  try {
+    await methodRunner.explore(methodTargets[3], 1);
+  } catch (e) {
+    badMethod = e.message;
+  }
+  equal(badMethod, '请求方法无效：G T', '无效的请求方法给出明确报错');
+
   const hidden = new NativeSourceRunner(definition, runHost, { mode: '不存在的值' });
   equal((await hidden.exploreMenus()).map((m) => m.title).includes('仅听书'), false, '非法变量值回退默认值');
 
@@ -332,6 +373,46 @@ try {
     { server: 'https://api.example.com' }).toc({ ...book, tocUrl: '' });
   equal(linesChapters.map((c) => c.title), ['第1页', '第2页', '第3页'], '多行文本同样视为分页列表');
 
+  // toc.batch：书源自己定每批并发页数。
+  paged.toc.nextUrl = "= data.data.total ? map(range(data.data.total), i => '/pages?p=' + (i + 1)) : data.data.next";
+  paged.toc.batch = 8;
+  equal(NativeSourceSpec.validate(NativeSourceSpec.fromObject(JSON.parse(JSON.stringify(paged)))), [],
+    'toc.batch 通过校验');
+  peak = 0;
+  const batchedChapters = await new NativeSourceRunner(NativeSourceSpec.fromObject(paged), pagedHost,
+    { server: 'https://api.example.com' }).toc({ ...book, tocUrl: '' });
+  equal(batchedChapters.length, 10, '调大并发后章节不变');
+  equal(peak, 8, 'toc.batch 决定每批并发页数');
+  for (const bad of [0, 17, 2.5, '8']) invalid((s) => { s.toc.batch = bad; }, `toc.batch 非法值 ${JSON.stringify(bad)}`);
+
+  // 目录与详情是同一个请求：目录第一页复用详情页响应，只复用一次；请求有任何不同都照常请求。
+  const samePage = JSON.parse(JSON.stringify(sample));
+  samePage.name = '同页书源';
+  samePage.detail = { fields: { name: '$.name' } };
+  samePage.toc = { list: '$.chapters[*]', fields: { title: '$.title', url: '$.url' } };
+  const sameHost = createTestHost(JsonPathEvaluator, async () => ({
+    name: '同页', chapters: [{ title: '第一章', url: '/c/1' }]
+  }));
+  const sameRun = () => new NativeSourceRunner(NativeSourceSpec.fromObject(samePage), sameHost,
+    { server: 'https://api.example.com' });
+  const sameBook = { ...book, bookUrl: 'https://api.example.com/same/1', tocUrl: '', vars: {} };
+  await sameRun().detail(sameBook);
+  const sameChapters = await sameRun().toc({ ...sameBook, tocUrl: sameBook.bookUrl });
+  equal(sameChapters.map((c) => [c.title, c.url]), [['第一章', 'https://api.example.com/c/1']],
+    '复用的响应照常解析，地址按详情页补全');
+  equal(sameHost.requests.length, 1, '目录与详情同址时不再请求');
+  equal(sameHost.traces.filter((t) => t.type === 'reuse').map((t) => t.field), ['目录请求'], '调试记录标出复用');
+  await sameRun().toc({ ...sameBook, tocUrl: sameBook.bookUrl });
+  equal(sameHost.requests.length, 2, '详情页只复用一次，再取目录照常请求');
+  samePage.toc.headers = { 'X-Toc': '1' };
+  await sameRun().detail(sameBook);
+  await sameRun().toc({ ...sameBook, tocUrl: sameBook.bookUrl });
+  equal(sameHost.requests.length, 4, '请求头不同不复用');
+  delete samePage.toc.headers;
+  await sameRun().detail(sameBook);
+  await sameRun().toc({ ...sameBook, tocUrl: 'https://api.example.com/same/1/toc' });
+  equal(sameHost.requests.length, 6, '地址不同不复用');
+
   // 逐章取字段很慢时分片让出主线程：解析途中定时器能执行，结果顺序不变；让出后发现已取消则返回空。
   const slowCount = 400;
   const slowToc = JSON.parse(JSON.stringify(sample));
@@ -373,6 +454,53 @@ try {
     { url: 'https://api.example.com/content?item_id=m1', title: '', index: 0 });
   equal(comic.text, '<img src="https://api.example.com/image?url=https%3A%2F%2Fi%2F1.png">\n' +
     '<img src="https://api.example.com/image?url=https%3A%2F%2Fi%2F2.png">', '漫画图片列表');
+
+  // 正文分页：逐页跟随超过 30 页；列表写法分批并发；指回第一页不重复请求；超过 200 页截断并记入调试。
+  const longChapter = JSON.parse(JSON.stringify(sample));
+  longChapter.content = {
+    text: '= data.text',
+    nextUrl: "= data.total ? map(range(data.total - 1), i => '/long?p=' + (i + 2)) : data.next"
+  };
+  let longInFlight = 0;
+  let longPeak = 0;
+  const longHost = createTestHost(JsonPathEvaluator, async (request) => {
+    const url = new URL(request.url);
+    const p = Number(url.searchParams.get('p') || 1);
+    const pages = Number(url.searchParams.get('n') || 0);
+    const listed = url.searchParams.get('list') === '1';
+    longInFlight++;
+    longPeak = Math.max(longPeak, longInFlight);
+    await new Promise((resolve) => setTimeout(resolve, listed ? (20 - p) % 7 : 0));
+    longInFlight--;
+    const next = url.searchParams.get('loop') === '1' ? `/long?n=${pages}&loop=1` :
+      (p < pages ? `/long?n=${pages}&p=${p + 1}` : '');
+    return { text: `第${p}页`, total: listed && p === 1 ? pages : 0, next: next };
+  });
+  const longRun = (definitionObject) => new NativeSourceRunner(NativeSourceSpec.fromObject(definitionObject), longHost,
+    { server: 'https://api.example.com' });
+  const longPages = (n) => Array.from({ length: n }, (_, i) => `第${i + 1}页`).join('\n');
+  const sixty = await longRun(longChapter).content(book, { url: 'https://api.example.com/long?n=60', title: '', index: 0 });
+  equal(sixty.text, longPages(60), '逐页跟随超过 30 页');
+  longHost.requests.length = 0;
+  const looped = await longRun(longChapter).content(book,
+    { url: 'https://api.example.com/long?n=5&loop=1', title: '', index: 0 });
+  equal([looped.text, longHost.requests.length], ['第1页', 1], 'nextUrl 指回第一页时停止');
+  longChapter.content.nextUrl = "= data.total ? map(range(data.total - 1), i => '/long?list=1&p=' + (i + 2)) : ''";
+  longChapter.content.batch = 6;
+  longHost.requests.length = 0;
+  longPeak = 0;
+  const listedChapter = await longRun(longChapter).content(book,
+    { url: 'https://api.example.com/long?list=1&n=20', title: '', index: 0 });
+  equal(listedChapter.text, longPages(20), '列表写法按列出顺序拼接');
+  equal([longHost.requests.length, longPeak], [20, 6], 'content.batch 决定每批并发页数');
+  delete longChapter.content.batch;
+  longChapter.content.nextUrl = '= data.next';
+  longHost.traces.length = 0;
+  const capped = await longRun(longChapter).content(book, { url: 'https://api.example.com/long?n=250', title: '', index: 0 });
+  equal(capped.text, longPages(200), '最多跟随 200 页');
+  equal(longHost.traces.filter((t) => t.type === 'limit').map((t) => [t.field, t.count]), [['content.nextUrl', 1]],
+    '截断时调试记录说明还有页没取');
+  invalid((s) => { s.content.batch = 0; }, 'content.batch 非法值');
 
   responses['/detail'] = { code: 3, message: '书籍不存在' };
   let failure = '';

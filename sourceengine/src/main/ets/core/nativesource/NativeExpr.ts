@@ -901,21 +901,27 @@ export class NativeExpr {
     while (cursor < template.length) {
       const open = template.indexOf('{{', cursor);
       if (open < 0) break;
+      // 按花括号层数找结束的 }}：表达式里的对象字面量 {{ {a: 1}}} 取到最后一组，
+      // 模板外的 JSON {"p":{{page}}} 则在 page 后结束，多出的 } 原样输出。
       let close = -1;
       let quote = '';
-      for (let i = open + 2; i < template.length - 1; i++) {
+      let depth = 0;
+      for (let i = open + 2; i < template.length; i++) {
         const ch = template[i];
         if (quote) {
           if (ch === '\\') i++;
           else if (ch === quote) quote = '';
         } else if (ch === '"' || ch === "'") {
           quote = ch;
-        } else if (ch === '}' && template[i + 1] === '}') {
-          // 表达式以对象字面量结尾时会出现 }}}，取最后一组。
-          let end = i;
-          while (end + 2 < template.length && template[end + 2] === '}') end++;
-          close = end;
-          break;
+        } else if (ch === '{') {
+          depth++;
+        } else if (ch === '}') {
+          if (depth > 0) {
+            depth--;
+          } else if (template[i + 1] === '}') {
+            close = i;
+            break;
+          }
         }
       }
       if (close < 0) throw new NativeExprError('模板里的 {{ 没有对应的 }}');

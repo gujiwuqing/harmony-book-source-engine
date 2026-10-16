@@ -119,6 +119,9 @@ export interface NativeMenuSpec {
   when?: string;
   /** 只在这个分类的请求上附加的请求头，例如个人书架需要的登录凭据。 */
   headers?: Record<string, string>;
+  /** 这个分类自己的请求方法与请求体，不写时沿用 explore 的。body 写空串表示不带请求体。 */
+  method?: string;
+  body?: NativeValue;
 }
 
 export interface NativeDynamicMenuSpec extends NativeRequestSpec {
@@ -142,6 +145,8 @@ export interface NativeDetailSpec extends NativeStageSpec {
 export interface NativeTocSpec extends NativeStageSpec {
   nextUrl?: string;
   reverse?: boolean;
+  /** nextUrl 列出剩余全部目录页时，每批并发请求的页数，1 到 16，默认 4。 */
+  batch?: number;
 }
 
 export interface NativeFetchSpec extends NativeRequestSpec {
@@ -200,8 +205,11 @@ export interface NativeContentSpec extends NativeStageSpec {
   mediaError?: string;
   /** 取图片、音频时附带的请求头，例如 Referer。 */
   mediaHeaders?: Record<string, string>;
-  imageDecode?: NativeImageDecodeSpec;
+  /** 正文分页地址：一个地址是下一页，列表或多行文本是本章剩余全部分页。 */
   nextUrl?: string;
+  /** nextUrl 列出剩余全部分页时，每批并发请求的页数，1 到 16，默认 4。 */
+  batch?: number;
+  imageDecode?: NativeImageDecodeSpec;
   replace?: NativeReplaceSpec[];
 }
 
@@ -479,6 +487,7 @@ export class NativeSourceSpec {
       if (!definition.toc.list) errors.push('toc 缺少 list');
       if (!fields['title']) errors.push('toc.fields 缺少 title');
       if (!fields['url']) errors.push('toc.fields 缺少 url');
+      NativeSourceSpec.checkBatch(definition.toc.batch, 'toc.batch', errors);
     }
     if (definition.content) {
       const content = definition.content;
@@ -486,6 +495,7 @@ export class NativeSourceSpec {
         errors.push('content 需要 text、images、audio 或 video 之一');
       }
       if (content.replace !== undefined && !Array.isArray(content.replace)) errors.push('content.replace 必须是数组');
+      NativeSourceSpec.checkBatch(content.batch, 'content.batch', errors);
       if (content.links !== undefined) {
         if (!Array.isArray(content.links)) {
           errors.push('content.links 必须是数组');
@@ -519,6 +529,12 @@ export class NativeSourceSpec {
       }
     }
     return errors;
+  }
+
+  private static checkBatch(batch: number | undefined, path: string, errors: string[]): void {
+    if (batch !== undefined && !(typeof batch === 'number' && Number.isInteger(batch) && batch >= 1 && batch <= 16)) {
+      errors.push(`${path} 必须是 1 到 16 的整数`);
+    }
   }
 
   private static requireBookFields(stage: NativeStageSpec, name: string, errors: string[]): void {
