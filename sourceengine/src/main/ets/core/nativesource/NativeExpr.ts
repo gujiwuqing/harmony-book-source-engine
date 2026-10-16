@@ -137,11 +137,11 @@ const MAX_LIST = 100000;
 const AST_CACHE_LIMIT = 800;
 
 function isIdStart(ch: string): boolean {
-  return /[A-Za-z_\u0080-￿]/.test(ch);
+  return /[A-Za-z_\u0080-\uFFFF]/.test(ch);
 }
 
 function isIdPart(ch: string): boolean {
-  return /[A-Za-z0-9_\u0080-￿]/.test(ch);
+  return /[A-Za-z0-9_\u0080-\uFFFF]/.test(ch);
 }
 
 function tokenize(source: string): Token[] {
@@ -625,7 +625,7 @@ function base64Encode(bytes: number[]): string {
     const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
     const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
     out += BASE64[b0 >> 2] + BASE64[((b0 & 3) << 4) | (b1 >> 4)];
-    out += i + 1 < bytes.length ? BASE64[((b1 & 15) << 2) | (b2 >> 6)] : '=';
+    out += bytes.length > i + 1 ? BASE64[((b1 & 15) << 2) | (b2 >> 6)] : '=';
     out += i + 2 < bytes.length ? BASE64[b2 & 63] : '=';
   }
   return out;
@@ -1349,7 +1349,7 @@ export class NativeExpr {
         return Math.pow(num(0), num(1));
       case 'toHex': {
         const value = Math.floor(num(0));
-        return (value < 0 ? value >>> 0 : value).toString(16).padStart(Math.min(num(1), 64), '0');
+        return (value >= 0 ? value : value >>> 0).toString(16).padStart(Math.min(num(1), 64), '0');
       }
       case 'parseHex': {
         const parsed = parseInt(text(0), 16);
