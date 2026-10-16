@@ -324,16 +324,35 @@ export class NativeSourceSpec {
     return 0;
   }
 
+  /** Decoded AES key length in bytes, or -1 when the key or its encoding is malformed. */
+  static coverKeyBytes(spec: NativeCoverDecodeSpec): number {
+    if (typeof spec.key !== 'string' || !spec.key || spec.key.length > 128) return -1;
+    if (spec.keyEncoding === 'utf8') {
+      // Same byte count util.TextEncoder produces (lone surrogates become U+FFFD), without a platform import.
+      let bytes = 0;
+      for (let i = 0; i < spec.key.length; i++) {
+        const code = spec.key.charCodeAt(i);
+        const next = spec.key.charCodeAt(i + 1);
+        if (code < 0x80) bytes += 1;
+        else if (code < 0x800) bytes += 2;
+        else if (code >= 0xD800 && code <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) { bytes += 4; i++; }
+        else bytes += 3;
+      }
+      return bytes;
+    }
+    if (spec.keyEncoding !== undefined && spec.keyEncoding !== 'hex') return -1;
+    return /^(?:[a-f0-9]{2})+$/i.test(spec.key) ? spec.key.length / 2 : -1;
+  }
+
   static validate(definition: NativeSourceDefinition): string[] {
     const errors: string[] = [];
     const cover = definition.coverDecode;
     if (cover !== undefined) {
       if (!cover || !/^AES\/CBC\/PKCS(?:5|7)Padding$/i.test(cover.algorithm || '') ||
-        typeof cover.key !== 'string' || !cover.key || cover.key.length > 128 ||
-        (cover.keyEncoding !== undefined && !['hex', 'utf8'].includes(cover.keyEncoding)) ||
+        ![16, 24, 32].includes(NativeSourceSpec.coverKeyBytes(cover)) ||
         (cover.ivPrefixBytes === 16 ? !!cover.iv :
           (cover.ivPrefixBytes !== undefined && cover.ivPrefixBytes !== 0) || !/^[a-f0-9]{32}$/i.test(cover.iv || ''))) {
-        errors.push('coverDecode 需要 AES/CBC/PKCS7Padding、key 和 iv 或 ivPrefixBytes:16');
+        errors.push('coverDecode 需要 AES/CBC/PKCS7Padding、16/24/32 字节的 key，以及 iv 或 ivPrefixBytes:16');
       }
     }
     if (!definition.name) errors.push('缺少书源名称 name');

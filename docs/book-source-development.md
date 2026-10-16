@@ -276,7 +276,7 @@ fn sign(path, ts) {
 图片地址仍由 `fields.coverUrl` 提取；HTML 延迟加载图片可使用 `img@data-src`，JSON 则使用对应字段规则。
 正文漫画现有的 `content.imageDecode` 有独立语义，不能把 `coverDecode` 的字段直接套到正文配置中。
 
-输入最多 8 MiB，支持加密封面与普通图片混用。解密后检查 JPEG/PNG/GIF/BMP/WebP/AVIF 文件头，非法密钥、截断密文或非图片结果返回错误。
+输入最多 8 MiB，支持加密封面与普通图片混用。解密后检查 JPEG/PNG/GIF/BMP/WebP/AVIF/HEIF 文件头；密钥长度在导入时即校验，非法密钥、截断密文或非图片结果返回错误。
 引擎输出 `#source-cover-v1=` 标记，片段只携带书源标识，不保存密钥或账号。
 宿主须按源会话调用公共加载器，持久化原地址并按需显示解密后的图片；未接入加载器的应用不能直接显示该地址。接入和缓存职责见[公共封面解密宿主接口](cover-decoding.md)。
 

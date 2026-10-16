@@ -18,7 +18,9 @@ try {
       const k = Buffer.from(key, 'hex');
       const cipher = crypto.createDecipheriv('aes-' + k.length * 8 + '-cbc', k, Buffer.from(iv, 'hex'));
       return new Uint8Array(Buffer.concat([cipher.update(data), cipher.final()]));
-    } };\n` + code;
+    } };
+    const NativeSourceSpec = globalThis.__coverCheckSpec;\n` + code;
+  globalThis.__coverCheckSpec = mods.NativeSourceSpec;
   const filename = path.join(dir, 'decoder.ts');
   fs.writeFileSync(filename, code);
   const { SourceImageDecoder: decoder } = await import(pathToFileURL(filename));
@@ -35,11 +37,32 @@ try {
   assert.throws(() => decoder.decode(new Uint8Array(decoder.MAX_BYTES + 1), spec));
   assert.throws(() => decoder.decode(encrypted, { ...spec, key: 'bad' }));
   assert.throws(() => decoder.decode(encrypted, { ...spec, iv: iv.toString('hex') }));
+  // An IV that happens to start with "BM" must still be decrypted rather than passed through as a bitmap.
+  const bmIv = Buffer.concat([Buffer.from('BM'), crypto.randomBytes(14)]);
+  const bmCipher = crypto.createCipheriv('aes-128-cbc', Buffer.from(key), bmIv);
+  const bmEncrypted = Buffer.concat([bmIv, bmCipher.update(png), bmCipher.final()]);
+  assert.deepEqual(Buffer.from(decoder.decode(bmEncrypted, spec)), png);
+  const bmp = Buffer.alloc(58);
+  bmp.write('BM', 0); bmp.writeUInt32LE(58, 2); bmp.writeUInt32LE(54, 10); bmp.writeUInt32LE(40, 14);
+  bmp.writeInt32LE(1, 18); bmp.writeInt32LE(1, 22); bmp.writeUInt16LE(1, 26); bmp.writeUInt16LE(24, 28);
+  assert.equal(decoder.decode(bmp, spec), bmp, 'a real bitmap is still recognised');
+  const heic = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypheic'), Buffer.alloc(20)]);
+  assert.equal(decoder.decode(heic, spec), heic, 'HEIF covers are recognised');
   const { SourceCoverUrl: urls, NativeSourceRunner: Runner, NativeSourceSpec: Spec, JsonPathEvaluator } = mods;
   const stage = { url: 'https://example.com/list', list: '=data', fields: { name: '=item.name', bookUrl: '=item.url', coverUrl: '=item.cover' } };
   const definition = { nativeSource: 1, name: 'test', url: 'https://example.com', coverDecode: spec,
     search: stage, explore: { ...stage, menus: [{ title: 'test', url: '/list' }] }, detail: { fields: { coverUrl: '=data[0].cover' } } };
   assert.deepEqual(Spec.validate(definition), []);
+  // Import rejects keys the decoder would refuse, instead of failing on every cover later.
+  for (const bad of [{ key: '0123456789abcde' }, { key: 'abc', keyEncoding: 'hex' }, { key: '00'.repeat(15), keyEncoding: 'hex' },
+    { key: '0123456789abcdef', keyEncoding: 'base64' }, { key: 'g'.repeat(32), keyEncoding: 'hex' }, { key: '' }]) {
+    assert.equal(Spec.validate({ ...definition, coverDecode: { ...spec, ...bad } }).length, 1, JSON.stringify(bad));
+  }
+  assert.deepEqual(Spec.validate({ ...definition, coverDecode: { ...spec, key: '00'.repeat(32), keyEncoding: 'hex' } }), []);
+  assert.deepEqual(Spec.validate({ ...definition, coverDecode: { ...spec, key: '密钥'.repeat(2) + '0000' } }), [],
+    'utf8 length counts bytes, not characters');
+  assert.equal(Spec.validate({ ...definition, coverDecode: { ...spec, key: '\ud800'.repeat(16) } }).length, 1,
+    'lone surrogates do not throw');
   const host = createTestHost(JsonPathEvaluator, () => [{ name: 'test', url: '/book', cover: 'https://cdn.example.com/a.webp' }]);
   const runner = new Runner(definition, host);
   const books = await runner.search('test', 1);
