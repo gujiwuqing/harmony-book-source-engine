@@ -312,6 +312,34 @@ try {
     { server: 'https://api.example.com' }).toc({ ...book, tocUrl: '' });
   equal(linesChapters.map((c) => c.title), ['第1页', '第2页', '第3页'], '多行文本同样视为分页列表');
 
+  // 逐章取字段很慢时分片让出主线程：解析途中定时器能执行，结果顺序不变；让出后发现已取消则返回空。
+  const slowCount = 400;
+  const slowToc = JSON.parse(JSON.stringify(sample));
+  slowToc.toc = { url: '{{server}}/slow', list: '$.data[*]', fields: { title: '$.title', url: '$.url' } };
+  const slowBase = createTestHost(JsonPathEvaluator, async () => ({
+    data: Array.from({ length: slowCount }, (_, i) => ({ title: `第${i + 1}章`, url: `/c/${i + 1}` }))
+  }));
+  const slowHost = {
+    ...slowBase,
+    jsonPath: (root, rule) => {
+      const until = performance.now() + 0.1;
+      while (performance.now() < until) { /* 模拟慢规则 */ }
+      return slowBase.jsonPath(root, rule);
+    }
+  };
+  let ticks = 0;
+  const ticker = setInterval(() => { ticks++; }, 1);
+  const slowChapters = await new NativeSourceRunner(NativeSourceSpec.fromObject(slowToc), slowHost,
+    { server: 'https://api.example.com' }).toc({ ...book, tocUrl: '' });
+  clearInterval(ticker);
+  equal(slowChapters.length, slowCount, '慢目录完整解析');
+  equal(slowChapters[slowCount - 1].title, `第${slowCount}章`, '分片让出后顺序不变');
+  equal(ticks > 3, true, '解析途中让出主线程，定时器得以执行');
+  let cancelAfter = 0;
+  const cancelledRunner = new NativeSourceRunner(NativeSourceSpec.fromObject(slowToc), slowHost,
+    { server: 'https://api.example.com' }).setCancelCheck(() => ++cancelAfter > 3);
+  equal((await cancelledRunner.toc({ ...book, tocUrl: '' })).length, 0, '让出后发现已取消，返回空目录');
+
   const text = await runner.content(book, { url: chapters[0].url, title: '第一章', index: 0 });
   equal(text.kind, 'text', '文本正文');
   equal(text.text, '第一页<img src="https://img.example.com/1.jpg">\n第二页',

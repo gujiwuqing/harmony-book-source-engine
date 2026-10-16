@@ -11,6 +11,7 @@ import { readEtsModule, toNodeModuleSource } from './ets-module-staging.mjs';
 const MODULES = [
   'core/nativesource/SourceCoverUrl.ts',
   'core/rule/JsonPathEvaluator.ts',
+  'core/concurrency/CooperativeScheduler.ts',
   'core/nativesource/NativeExpr.ts',
   'core/nativesource/NativeSourceSpec.ts',
   'core/nativesource/NativeSourceRunner.ts',

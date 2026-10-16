@@ -71,3 +71,5 @@ import { QuickJsDiagnostics } from '@legado/sourceengine/Diagnostics';
 node --experimental-strip-types scripts/native-source-check.mjs
 node scripts/neutral-source-engine-check.mjs
 ```
+
+改动 `AnalyzeRule`（选择器、属性提取、旧式写法）后再运行 `node --experimental-strip-types scripts/analyze-rule-check.mjs`。它用 `scripts/lib/load-analyze-rule.mjs` 把 AnalyzeRule 及其依赖加载进 Node（系统模块换成空桩，脚本会自动加上 `--experimental-transform-types` 重跑），把一组页面 × 规则的结果与 `scripts/fixtures/analyze-rule-golden.json` 比对，并打印 HTML 目录取字段的参考耗时。确认是有意改变选择器行为时，加 `--update` 重写基准。

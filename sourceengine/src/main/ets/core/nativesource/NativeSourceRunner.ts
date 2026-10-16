@@ -4,6 +4,7 @@
  * 网络与选择器通过 NativeRunnerHost 注入，本文件不依赖系统 API，可直接在 Node 回归脚本中加载。
  */
 
+import { CooperativeScheduler } from '../concurrency/CooperativeScheduler';
 import { NativeExpr, NativeScope } from './NativeExpr';
 import { SourceCoverUrl } from './SourceCoverUrl';
 import type { NativeExprHost, NativeValue } from './NativeExpr';
@@ -193,6 +194,32 @@ const MAX_CONTENT_PAGES = 30;
 const MAX_LIST_ITEMS = 20000;
 const DEFAULT_COMMENT_BUBBLES = 60;
 const MAX_COMMENT_BUBBLES = 300;
+
+/**
+ * 逐章取字段时让出主线程，节奏与兼容书源的 RuleExecutionService 相同：连续执行约 6 ms 让出一次，
+ * 距上次空出整帧超过 50 ms 时改为空出一帧（只让 1 ms 可能仍落在同一个原生定时器任务里）。
+ */
+class UiPacer {
+  private static readonly SLICE_MS: number = CooperativeScheduler.DEFAULT_UI_SLICE_MS;
+  private static readonly FRAME_MS: number = 50;
+  private sliceStartedAt: number = Date.now();
+  private frameYieldedAt: number = Date.now();
+
+  /** 时间片用完时让出；没用完时不产生 await，避免每章多一次微任务。 */
+  due(): boolean {
+    return Date.now() - this.sliceStartedAt >= UiPacer.SLICE_MS;
+  }
+
+  async yield(): Promise<void> {
+    if (Date.now() - this.frameYieldedAt >= UiPacer.FRAME_MS) {
+      await CooperativeScheduler.yieldToNextUiFrame();
+      this.frameYieldedAt = Date.now();
+    } else {
+      await CooperativeScheduler.yieldToEventLoop();
+    }
+    this.sliceStartedAt = Date.now();
+  }
+}
 
 export class NativeSourceRunner {
   private definition: NativeSourceDefinition;
@@ -418,13 +445,16 @@ export class NativeSourceRunner {
     const nextStage: NativeStageSpec = Object.assign({}, stage, { url: '= __url' });
     const pageScope = async (page: number, url: string): Promise<NativeScope> =>
       (await this.baseScope()).set('book', book).set('page', page).child().set('__url', url);
+    const pacer = new UiPacer();
     let nextUrl = '';
     for (let page = 1; page <= MAX_TOC_PAGES; page++) {
       if (this.cancelled()) return [];
       const loaded = await this.loadStage(page === 1 ? stage : nextStage, await pageScope(page, nextUrl),
         defaultUrl, '目录');
       visited.add(loaded.baseUrl);
-      if (this.appendTocPage(stage, loaded, chapters, limit)) break;
+      const full = await this.appendTocPage(stage, loaded, chapters, limit, pacer);
+      if (this.cancelled()) return [];
+      if (full) break;
       if (!stage.nextUrl) break;
       const pending = this.tocNextUrls(stage.nextUrl, loaded).filter((url: string): boolean => !visited.has(url));
       if (pending.length === 0) break;
@@ -441,9 +471,9 @@ export class NativeSourceRunner {
         const pages = await Promise.all(batch.map(async (url: string, index: number): Promise<StagePage> =>
           this.loadStage(nextStage, await pageScope(page + offset + index + 1, url), defaultUrl, '目录')));
         for (const listedPage of pages) {
-          if (this.appendTocPage(stage, listedPage, chapters, limit)) {
-            return stage.reverse === true ? chapters.reverse() : chapters;
-          }
+          const listedFull = await this.appendTocPage(stage, listedPage, chapters, limit, pacer);
+          if (this.cancelled()) return [];
+          if (listedFull) return stage.reverse === true ? chapters.reverse() : chapters;
         }
       }
       break;
@@ -451,11 +481,15 @@ export class NativeSourceRunner {
     return stage.reverse === true ? chapters.reverse() : chapters;
   }
 
-  /** 把一页目录的章节追加到 chapters；到达条数上限时返回 true。 */
-  private appendTocPage(stage: NativeTocSpec, loaded: StagePage, chapters: NativeChapterRecord[],
-    limit: number): boolean {
+  /** 把一页目录的章节追加到 chapters；到达条数上限或已取消时返回 true。 */
+  private async appendTocPage(stage: NativeTocSpec, loaded: StagePage, chapters: NativeChapterRecord[],
+    limit: number, pacer: UiPacer): Promise<boolean> {
     const fields = stage.fields || {};
     for (const item of this.listItems(stage.list || '', loaded.scope, loaded.baseUrl, 'toc.list')) {
+      if (pacer.due()) {
+        await pacer.yield();
+        if (this.cancelled()) return true;
+      }
       const itemScope = loaded.scope.child().set('item', item).set('index', chapters.length);
       const title = NativeExpr.toText(this.value(fields['title'], itemScope, false, 'toc.fields.title')).trim();
       if (!title) continue;
