@@ -14,7 +14,7 @@
 | 简听的导入限制、安全预算、UI 和缓存 | [简听宿主说明](https://github.com/end-web/HarmonyOS-book/blob/main/docs/BOOK_SOURCE_RULES.md) |
 | 封面解密 | 本文 `coverDecode` 字段；宿主还需接入 [SourceCoverLoader](cover-decoding.md)，不能仅靠更新文档或 JSON 获得显示能力 |
 
-迁移时轻页参考版本为 4.0.919；共享文档更新日期为 2026-10-16。下文保留的轻页 UI、视频和调试能力不代表所有宿主均已实现。简听已接入新封面解密；轻页此文档迁移不包含其封面 UI 接入。
+迁移时轻页参考版本为 4.0.919，本文最近一次按代码核对时轻页为 4.0.921（2026-10-16）。下文保留的轻页 UI、视频和调试能力不代表所有宿主均已实现。简听与轻页（4.0.921 起）都已接入封面解密。
 
 > 示例只使用 `example.com`、本地测试服务和虚构数据，不发布实际站点书源或登录凭据。
 
@@ -427,7 +427,7 @@ fn sign(path, ts) {
 |---|---|
 | `url` | 请求地址（表达式或模板）。求值结果为空时不发请求 |
 | `method`、`headers`、`body` | 请求方法、附加请求头、请求体。`body` 是对象时按 JSON 发送，其中的字符串按模板渲染；有 `body` 时默认用 POST。值为空的请求头不发送 |
-| `webView` | 为 `true` 时用内置浏览器加载页面，取执行完网页自身脚本后的内容，再套用规则。只用于必须渲染才有数据的站点，比普通请求慢得多。内容是异步加载出来的，可以写成 `{ "waitFor": ".chapter-content", "timeout": 15 }`：等这个选择器对应的元素出现再取页面，到时间还没出现就取当时的页面。等待时间受应用上限约束，实际约十秒量级 |
+| `webView` | 为 `true` 时用内置浏览器加载页面，取执行完网页自身脚本后的内容，再套用规则。只用于必须渲染才有数据的站点，比普通请求慢得多。内容是异步加载出来的，可以写成 `{ "waitFor": ".chapter-content", "timeout": 15 }`：等这个选择器对应的元素出现再取整页内容。`timeout` 单位为秒，默认 15，取值 3～60。到时间还没出现时，本次请求按失败处理，提示“网页等待条件未满足”；如果当时的页面是人机验证或登录拦截页，仍会进入「去验证」流程。带 `waitFor` 的请求同样遵守限流与 `retry` |
 | `charset` | 请求参数和表单的编码，例如 `gbk`。要求搜索词按 GBK 编码的老站点需要它；响应的解码由应用自动识别，不用写 |
 | `retry` | 请求失败后的重试次数，0 到 3，默认不重试 |
 | `let` | 本阶段的派生值，在拿到响应之后求值 |
@@ -436,6 +436,8 @@ fn sign(path, ts) {
 `detail`、`toc`、`content` 的 `url` 可以省略，分别默认使用书籍详情地址、目录地址、章节地址。
 
 各阶段的主请求如果拿到的是人机验证页或登录拦截页，应用会提示用户「去验证」，在内置浏览器里完成后重试；附加请求（`fetch`、`comments.stats`、`cache`）不触发这个流程。
+
+请求本身没有发出去或没有响应（域名解析失败、超时、连接被拒等）时，直接把网络原因报给用户，例如“网络连接超时”，不会因为书源配置了登录入口就误报“需要登录或网页验证”。
 
 ### 搜索 `search`
 
@@ -484,6 +486,18 @@ fn sign(path, ts) {
 ```
 
 没有给出 `tocUrl` 时，目录阶段请求详情地址。
+
+详情数据分散在几个接口里时（例如作者在一个接口、最新章节在另一个接口），用 `fetch` 声明附加请求，写法与[正文的附加请求](#正文的附加请求与评论)相同：在主请求之后按声明顺序发出，结果按名称绑定为变量，`fields`、`keep` 里可以直接读取；请求失败或 `when` 为假时该变量为 `null`。
+
+```json
+"detail": {
+  "let": { "d": "= data.data ?? data" },
+  "fetch": {
+    "latest": { "url": "{{server}}/book/{{d.id}}/latest" }
+  },
+  "fields": { "name": "= d.name", "lastChapter": "= latest.data.title ?? ''" }
+}
+```
 
 ### 目录 `toc`
 
@@ -666,7 +680,10 @@ fn sign(path, ts) {
 
 ```bash
 node --experimental-strip-types scripts/native-source-check.mjs
+node --experimental-strip-types scripts/source-cover-check.mjs
 ```
+
+目录逐章取字段时会分片让出主线程，几千章的目录不会长时间卡住界面。
 
 ---
 
@@ -1517,6 +1534,7 @@ QuickJS 不能直接替代 JSONPath/CSS/XPath：选择器需要解析 HTML/JSON 
 - AES、DES/3DES 的常见 Base64 加解密；
 - `java.getString`、`java.getStringList` 读取当前内容：`$.` 开头的 JSON 路径直接取值，其他规则由原生规则引擎按完整规则语法求值；
 - `java.getCookie`、`cookie.getCookie/setCookie/removeCookie`；
+- `java.toast` / `java.longToast`：详情、目录、正文阶段弹出的提示交给宿主显示（宿主通过 `SourceScriptNotice.setHandler` 接收，轻页显示为应用内提示），同一书源的同一条提示 15 秒内只转发一次；搜索、发现和登录界面有各自的提示方式，不经过这里；
 - `java.randomUUID()`、`java.androidId()`；
 - `java.put/get`、`source.get/put/getVariable/setVariable`、`source.key`（与 Android 端 `source.key` 属性一致，取书源地址）、`book.getVariable/putVariable`；轻量引擎处理完 `java.*` 调用后，剩余的字符串链、三元和正则字面量表达式会交给 QuickJS 兜底求值，修复字面 `\n` 被展开、时间戳显示为 1970 之类的问题；
 - `baseUrl` 会随当前规则解析地址注入；分阶段 ArkWeb 还提供带 `get/put/save` 的临时 `infoMap`；
@@ -2000,6 +2018,7 @@ https://img.example/page.jpg,{"headers":{"Referer":"https://example.com/"}}
 | 浏览器能下载 JSON，但 URL 导入失败 | 确认返回体不是 HTML 跳转页；查看错误来自应用 HTTP、TCP、ArkWeb 下载还是系统下载；必要时改用本地文件导入。 |
 | 导入提示 `[object Object]` | 当前版本会展开 `message/msg/reason/code`；若仍出现，保留完整错误和 URL，检查服务是否返回了非标准对象或空下载错误。 |
 | HTTP 成功但列表为 0 | 响应实际是 JSON 还是 HTML；列表规则是否在完整响应运行；字符集和登录页。 |
+| 提示网络错误（域名解析失败、超时、连不上） | 请求没有到达站点，与规则和登录无关；检查网络、书源地址的域名和端口。网络错误不会被当成“需要验证”，搜索与发现会直接显示具体原因。 |
 | 列表命中但无结果 | 子规则上下文是否错误；最常见是 `name` 或 `bookUrl` 为空。 |
 | 中文搜索乱码 | 使用 `{{searchKeyRaw}}` 并在 URL 选项中指定 `gb2312`/`gbk`。 |
 | URL 中出现 `%257B`、关键字双重编码 | 不要预编码 `{{key}}`，或改用 `{{searchKeyRaw}}`。 |

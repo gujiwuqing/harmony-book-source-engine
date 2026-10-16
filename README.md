@@ -8,7 +8,15 @@ HarmonyOS（ArkTS）书源解析内核，从[开源轻页（legado-harmony）](h
 - **脚本运行时**：受限 QuickJS，以及需要完整 JavaScript 语义时的分阶段 ArkWeb 运行层。
 - **可选宿主端口**：Cookie、持久化、脚本执行器、请求调度、网页会话、错误状态与耗时诊断都可以由宿主替换。
 
-内核不包含界面，也不访问应用数据库。搜索、发现、详情/目录/正文的调度由宿主应用实现。
+内核不包含界面，也不访问应用数据库。搜索、发现、详情/目录/正文的调度由宿主应用实现。目前开源轻页和简听都以本仓库为书源内核。
+
+## 文档
+
+| 文档 | 读者 |
+| --- | --- |
+| [书源规则开发文档](docs/book-source-development.md) | 书源作者。原生书源与兼容书源的字段、表达式、选择器、示例与调试方法，在本仓库统一维护，轻页和简听的文档入口都指向这里；宿主界面与安全策略由各应用自己说明 |
+| [sourceengine/README.md](sourceengine/README.md) | 宿主开发者。HAR 的入口约束、必须接入的部分与可选宿主端口 |
+| [封面解密接入](docs/cover-decoding.md) | 宿主开发者。原生书源可声明 `coverDecode`，宿主用公共 `SourceCoverLoader` 按需加载，支持 AES-CBC 文件前缀 IV |
 
 ## 仓库结构
 
@@ -64,6 +72,20 @@ DEVECO_HOME="/c/Program Files/Huawei/DevEco Studio" node scripts/source-engine-h
 DEVECO_HOME="/c/Program Files/Huawei/DevEco Studio" node scripts/web-book-fetch-wait-check.cjs
 ```
 
+| 脚本 | 检查内容 |
+| --- | --- |
+| `native-source-check` | 原生书源：表达式、各阶段字段、附加请求、目录分页、媒体错误原因 |
+| `analyze-rule-check` | 兼容书源选择器与属性提取，结果与 `scripts/fixtures/analyze-rule-golden.json` 比对，并打印取字段耗时 |
+| `source-cover-check` | 封面解密参数校验、图片嗅探与解密 |
+| `page-candidate-url-check` | 搜索与发现地址的页码候选写法 |
+| `source-request-support-check` | 请求层：`Set-Cookie` 拆分、相对地址解析、`concurrentRate` 解析、规则变量表 |
+| `source-script-runtime-check` | 脚本路由、异步 `webJs`、动态请求头缓存控制 |
+| `http-auth-check` | Basic / Digest 认证质询解析与应答（RFC 2617 / 7616 标准向量） |
+| `java-regex-compat-check` / `budgeted-regex-replace-check` / `replace-rule-import-check` | Java 正则方言转换、带时间预算的净化替换、净化规则导入 |
+| `neutral-source-engine-check` | 内核里没有固定内容接口、默认凭据或站点专用后端 |
+| `source-engine-host-check.cjs` | 可选宿主端口：串行与并发执行器、Cookie、持久化、取消、原生书源导入 |
+| `web-book-fetch-wait-check.cjs` | 网页抓取的等待条件：等待时长、条件未满足时保留页面、无效条件立即失败 |
+
 这些脚本只在 Node 里跑纯逻辑，平台 API 用替身代替，不能代替真机验证。
 
 ## 许可
@@ -71,6 +93,3 @@ DEVECO_HOME="/c/Program Files/Huawei/DevEco Studio" node scripts/web-book-fetch-
 本项目以 [GNU General Public License v3.0](LICENSE) 发布。使用、修改或分发本项目（包括把它链接进你的应用）时，需要遵守 GPL-3.0 的条款。
 
 第三方组件（ohos_quickjs、QuickJS、部分 Huawei N-API 封装代码）分别遵循 MIT 与 Apache-2.0 许可，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与 [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt)。
-封面解密接入见 [公共封面解密](docs/cover-decoding.md)：原生书源可声明 `coverDecode`，宿主使用公共 `SourceCoverLoader` 按需加载，支持 AES-CBC 文件前缀 IV。
-
-书源作者请阅读[公共书源规则开发文档](docs/book-source-development.md)。规则格式与示例在此统一维护，轻页和简听的文档入口共同引用，宿主 UI 与安全策略由各应用维护。
