@@ -16,6 +16,7 @@
 #include "napi/native_api.h"
 #include "quickjs_headers.h"
 #include "handle_registry.h"
+#include "script_session.h"
 #include <string>
 #include <vector>
 #include <cstring>
@@ -1136,6 +1137,7 @@ static napi_value Init(napi_env env, napi_value exports)
         { "throwException", nullptr, ThrowException, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
+    DefineScriptSessionExports(env, exports);
     return exports;
 }
 EXTERN_C_END

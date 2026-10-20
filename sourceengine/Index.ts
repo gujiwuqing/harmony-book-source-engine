@@ -276,6 +276,7 @@ export {
   QuickJsScriptRuntime,
   QuickJsShadowComparator
 } from './src/main/ets/core/script/QuickJsScriptRuntime';
+export { ScriptProbeResult, ScriptThreadProbe } from './src/main/ets/core/script/ScriptThreadProbe';
 export {
   QuickJsValidationEvent,
   QuickJsValidationSeed,

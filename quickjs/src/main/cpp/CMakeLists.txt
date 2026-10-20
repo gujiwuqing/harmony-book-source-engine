@@ -18,6 +18,7 @@ set(SELF_LIB_NAME quickjs)
 set(SELF_SRC_FILES
     napi_init.cpp
     quickjs_ext.cpp
+    script_session.cpp
 )
 add_library(${SELF_LIB_NAME} SHARED ${SELF_SRC_FILES})
 target_link_libraries(${SELF_LIB_NAME} PUBLIC libace_napi.z.so libhilog_ndk.z.so)

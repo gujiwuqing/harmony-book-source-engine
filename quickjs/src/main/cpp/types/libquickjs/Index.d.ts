@@ -85,4 +85,26 @@ export interface QuickJsNativeApi {
   // Error / Exception
   getException(engineHandle: bigint): bigint;
   throwException(engineHandle: bigint, valueHandle: bigint): bigint;
+
+  // Script sessions: QuickJS on a background thread with synchronous host calls
+  scriptSessionCreate(memoryLimitBytes: number, stackLimitBytes: number, hostTimeoutMs: number,
+    onHostCall: (callId: number, name: string, payload: string) => void): number;
+  scriptSessionEval(sessionId: number, script: string, sourceURL: string,
+    cpuTimeoutMs: number): Promise<ScriptSessionOutcome>;
+  scriptSessionResolve(sessionId: number, callId: number, ok: boolean, payload: string): boolean;
+  scriptSessionCancel(sessionId: number): void;
+  scriptSessionRelease(sessionId: number): void;
+}
+
+export interface ScriptSessionOutcome {
+  success: boolean;
+  value: string;
+  error: string;
+  timedOut: boolean;
+  cancelled: boolean;
+  /** Wall time minus time spent waiting for the host. */
+  cpuMs: number;
+  wallMs: number;
+  hostWaitMs: number;
+  hostCalls: number;
 }
