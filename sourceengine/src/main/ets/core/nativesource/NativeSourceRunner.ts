@@ -10,9 +10,10 @@ import { SourceCoverUrl } from './SourceCoverUrl';
 import { NativeJsPrelude } from './NativeJsPrelude';
 import { NativeScriptHost, NativeScriptLimits } from './NativeScriptHost';
 import type { NativeScriptEngine } from './NativeScriptHost';
+import type { NativeBrowserResult } from './NativeSourceInteraction';
 import type { NativeExprHost, NativeScriptLibrary, NativeValue } from './NativeExpr';
 import type {
-  NativeActionSpec, NativeCommentsSpec, NativeContentSpec, NativeFetchSpec, NativeMenuSpec, NativeRequestSpec,
+  NativeActionSpec, NativeVarSpec, NativeCommentsSpec, NativeContentSpec, NativeFetchSpec, NativeMenuSpec, NativeRequestSpec,
   NativeSourceDefinition, NativeStageSpec, NativeTocSpec
 } from './NativeSourceSpec';
 
@@ -30,6 +31,8 @@ export interface NativeRequest {
   retry: number;
   /** 主请求：遇到验证页时应提示用户去验证。附加请求不触发。 */
   primary: boolean;
+  /** 网页渲染后在页面里执行的表达式（脚本的 browser.render），结果作为响应正文。 */
+  webJs?: string;
 }
 
 export interface NativeLoginState {
@@ -100,6 +103,20 @@ export interface NativeRunnerHost extends NativeExprHost {
   saveCredential?(token: string, user: string): Promise<void>;
   deviceId?(): string;
   userAgent?(): string;
+  /** 脚本的 ui.toast。 */
+  toast?(message: string): void;
+  /** 脚本的 ui.refreshExplore。 */
+  refreshExplore?(): Promise<void>;
+  /** 脚本的 browser.verify / browser.open：wait 为 true 时等用户完成并返回页面。 */
+  openBrowser?(url: string, title: string, wait: boolean): Promise<NativeBrowserResult>;
+  /** 非交互场景需要网页验证时，交给应用现有的「去验证」流程。 */
+  requestVerification?(url: string, title: string): void;
+}
+
+/** 设置页动态选项的结果：失败时 options 为空、error 为原因。 */
+export interface NativeVarOptions {
+  options: string[];
+  error: string;
 }
 
 export interface NativeBookRecord {
@@ -209,6 +226,13 @@ interface KeptPage {
   keptAt: number;
 }
 
+/** 一次脚本函数运行的结果。 */
+interface ScriptRun {
+  value: NativeValue;
+  requests: number;
+  ms: number;
+}
+
 /** loadStage 对响应的处理：keep 记下供之后复用，take 有记下的同一请求时直接用、不再请求。 */
 type StageReuse = '' | 'keep' | 'take';
 
@@ -306,7 +330,9 @@ export class NativeSourceRunner {
 
   /** 表单登录：用用户填写的值发登录请求。 */
   async submitLogin(form: Record<string, string>): Promise<NativeLoginResult> {
-    const submit = this.definition.login ? this.definition.login.submit : undefined;
+    const login = this.definition.login;
+    if (login && login.script) return await this.scriptLogin(String(login.script).trim(), form);
+    const submit = login ? login.submit : undefined;
     if (!submit) return { ok: false, token: '', user: '', message: '该书源没有配置表单登录' };
     const scope = (await this.baseScope()).set('form', form);
     const response = await this.host.fetch(this.buildRequest(submit, scope, ''));
@@ -326,11 +352,73 @@ export class NativeSourceRunner {
     };
   }
 
+  /**
+   * 脚本登录：函数拿到 ctx.form，自己发请求，成功时调用 login.save(令牌, 用户名)。返回值可以是提示文字，
+   * 或 { ok, message }；没有明确给出 ok 时，以是否保存了凭据为准。密码只在这次调用里使用，不会保存。
+   */
+  private async scriptLogin(fn: string, form: Record<string, string>): Promise<NativeLoginResult> {
+    const scope = (await this.baseScope()).set('form', form);
+    const before = this.credential.token;
+    const ctx = this.scriptContext(scope, 'login');
+    ctx['form'] = form;
+    let value: NativeValue;
+    try {
+      value = (await this.runScriptFunction(fn, ctx, 'login.script', scope, true, null)).value;
+    } catch (e) {
+      return { ok: false, token: '', user: '', message: `登录失败：${(e as Error).message}` };
+    }
+    const saved = !!this.credential.token && this.credential.token !== before;
+    const explicit = value && typeof value === 'object' && !Array.isArray(value) && value['ok'] !== undefined;
+    const ok = explicit ? NativeExpr.isTruthy(value['ok']) : saved;
+    const message = NativeSourceRunner.scriptMessage(value);
+    return {
+      ok: ok,
+      token: ok ? this.credential.token : '',
+      user: ok ? this.credential.user : '',
+      message: message || (ok ? '' : '登录失败')
+    };
+  }
+
+  /** 脚本返回值里给用户看的提示：字符串本身，或对象的 message。 */
+  private static scriptMessage(value: NativeValue): string {
+    if (typeof value === 'string') return value.trim();
+    if (value && typeof value === 'object' && !Array.isArray(value) && value['message'] !== undefined) {
+      return NativeExpr.toText(value['message']).trim();
+    }
+    return '';
+  }
+
+  /**
+   * 书源设置页的动态选项：vars 里写了 optionsScript 的变量，运行对应函数取选项列表。
+   * 函数失败时给出原因，设置页退回到 options 里写死的选项。
+   */
+  async varOptions(): Promise<Record<string, NativeVarOptions>> {
+    const result: Record<string, NativeVarOptions> = {};
+    const specs = (this.definition.vars || []).filter((item: NativeVarSpec): boolean => !!item.optionsScript);
+    if (specs.length === 0) return result;
+    const scope = await this.baseScope();
+    for (const item of specs) {
+      const fn = String(item.optionsScript).trim();
+      const ctx = this.scriptContext(scope, 'options');
+      ctx['key'] = item.key;
+      try {
+        const value: NativeValue = (await this.runScriptFunction(fn, ctx, `vars.${item.key}`, scope, true, null)).value;
+        const options = (Array.isArray(value) ? value : []).map((option: NativeValue): string => NativeExpr.toText(option).trim())
+          .filter((option: string): boolean => !!option);
+        result[item.key] = options.length > 0 ? { options: options, error: '' } :
+          { options: [], error: '没有拿到选项' };
+      } catch (e) {
+        result[item.key] = { options: [], error: (e as Error).message };
+      }
+    }
+    return result;
+  }
+
   /** 表单登录的辅助请求（发送验证码等），返回提示文字。 */
   async sendLoginCode(form: Record<string, string>): Promise<string> {
     const spec = this.definition.login ? this.definition.login.sendCode : undefined;
     if (!spec) return '该书源没有配置这个操作';
-    return await this.performAction(spec, (await this.baseScope()).set('form', form), 'login.sendCode');
+    return await this.performAction(spec, (await this.baseScope()).set('form', form), 'login.sendCode', { form: form });
   }
 
   /** 书源设置页里可用的动作按钮。 */
@@ -368,7 +456,20 @@ export class NativeSourceRunner {
     return NativeExpr.toText(this.value(messageSpec, page, false, 'content.links.message')).trim() || '已完成';
   }
 
-  private async performAction(spec: NativeActionSpec, scope: NativeScope, field: string): Promise<string> {
+  private async performAction(spec: NativeActionSpec, scope: NativeScope, field: string,
+    extra: Record<string, NativeValue> = {}): Promise<string> {
+    if (spec.script) {
+      const fn = String(spec.script).trim();
+      const ctx = this.scriptContext(scope, 'action');
+      ctx['action'] = NativeExpr.toText(this.template(spec.label || '', scope)).trim();
+      for (const key of Object.keys(extra)) ctx[key] = extra[key];
+      try {
+        const run = await this.runScriptFunction(fn, ctx, field, scope, true, null);
+        return NativeSourceRunner.scriptMessage(run.value) || '已完成';
+      } catch (e) {
+        return `操作失败：${(e as Error).message}`;
+      }
+    }
     const request = this.buildRequest(spec, scope, '');
     if (!request.url) return '操作没有可用的地址';
     const response = await this.host.fetch(request);
@@ -939,9 +1040,12 @@ export class NativeSourceRunner {
    * 脚本阶段：在后台运行 js 里的函数，它的返回值就是这个阶段的“页面”。字符串当作原文，数组或对象当作
    * 已解析的 JSON，page(body, url) 带上页面地址。之后的 list、fields 等规则照常在上面求值。
    */
-  private async loadScriptStage(stage: NativeStageSpec, scope: NativeScope, label: string): Promise<StagePage> {
-    const fn = String(stage.script || '').trim();
-    const stageName = STAGE_NAMES[label] || label;
+  /**
+   * 在后台运行 js 里的函数 fn(ctx)。interactive 表示用户主动发起的操作，可以弹出网页；搜索、发现不行。
+   * 出错时抛出原始原因，由调用方加上是哪个阶段、哪个按钮。
+   */
+  private async runScriptFunction(fn: string, ctx: Record<string, NativeValue>, stageName: string, scope: NativeScope,
+    interactive: boolean, keep: Record<string, string> | null): Promise<ScriptRun> {
     const limits = NativeScriptLimits.of(this.definition.scriptLimits ? this.definition.scriptLimits.requests : undefined);
     const scriptHost = new NativeScriptHost({
       host: this.host,
@@ -956,19 +1060,35 @@ export class NativeSourceRunner {
       temp: this.temp,
       credential: (): NativeValue => ({ token: this.credential.token, user: this.credential.user }),
       saveCredential: (token: string, user: string): Promise<void> => this.saveCredential(token, user),
-      keep: stageName === 'detail' ? this.scriptKeep : null
+      keep: keep,
+      interactive: interactive
     });
     const startedAt = Date.now();
-    let value: NativeValue;
     try {
-      value = await this.scriptEngine().run(fn, this.scriptContext(scope, stageName), scriptHost.handler(), {
-        cpuMs: limits.cpuMs, wallMs: limits.wallMs, cancelled: this.cancelled
+      const value: NativeValue = await this.scriptEngine().run(fn, ctx, scriptHost.handler(), {
+        cpuMs: limits.cpuMs, wallMs: limits.wallMs, cancelled: this.cancelled,
+        pausedMs: (): number => scriptHost.pausedMs
       });
+      return { value: value, requests: scriptHost.requestCount, ms: Date.now() - startedAt };
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       this.traceScript(stageName, fn, 'return', '', message);
-      throw new NativeSourceError(`${label}脚本 ${fn}：${message}`);
+      throw new Error(message);
     }
+  }
+
+  private async loadScriptStage(stage: NativeStageSpec, scope: NativeScope, label: string): Promise<StagePage> {
+    const fn = String(stage.script || '').trim();
+    const stageName = STAGE_NAMES[label] || label;
+    const interactive = stageName === 'detail' || stageName === 'toc' || stageName === 'content';
+    let run: ScriptRun;
+    try {
+      run = await this.runScriptFunction(fn, this.scriptContext(scope, stageName), stageName, scope, interactive,
+        stageName === 'detail' ? this.scriptKeep : null);
+    } catch (e) {
+      throw new NativeSourceError(`${label}脚本 ${fn}：${(e as Error).message}`);
+    }
+    const value: NativeValue = run.value;
     let baseUrl = NativeExpr.toText(scope.get('baseUrl')) || this.definition.url;
     let pageScope: NativeScope;
     if (NativeJsPrelude.isPage(value) || typeof value === 'string') {
@@ -984,8 +1104,8 @@ export class NativeSourceRunner {
     const data = pageScope.get('data');
     pageScope.set('__items', Array.isArray(data) ? data : (data === null || data === undefined ? [] : [data]));
     this.traceScript(stageName, fn, 'return', `${Array.isArray(data) ? `${data.length} 项` :
-      (data !== null ? '对象' : `${NativeExpr.toText(pageScope.get('body')).length} 字`)}，请求 ${scriptHost.requestCount} 次，` +
-      `${Date.now() - startedAt} ms`, '');
+      (data !== null ? '对象' : `${NativeExpr.toText(pageScope.get('body')).length} 字`)}，请求 ${run.requests} 次，` +
+      `${run.ms} ms`, '');
     return { scope: pageScope, baseUrl: baseUrl };
   }
 

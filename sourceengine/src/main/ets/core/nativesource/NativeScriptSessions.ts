@@ -37,6 +37,7 @@ export class NativeScriptSessions implements NativeScriptEngine {
   private static readonly IDLE_PER_CODE: number = 2;
   private static readonly IDLE_TOTAL: number = 8;
   private static readonly POLL_MS: number = 100;
+  private static readonly HOST_WAIT_MS: number = 15 * 60 * 1000;
   private static idle: Map<string, PooledSession[]> = new Map();
   private code: string;
   private key: string;
@@ -62,7 +63,7 @@ export class NativeScriptSessions implements NativeScriptEngine {
       if (options.cancelled()) {
         cancelled = true;
         pooled.session.cancel();
-      } else if (Date.now() - startedAt > options.wallMs) {
+      } else if (Date.now() - startedAt - (options.pausedMs ? options.pausedMs() : 0) > options.wallMs) {
         overtime = true;
         pooled.session.cancel();
       }
@@ -95,7 +96,10 @@ export class NativeScriptSessions implements NativeScriptEngine {
       if (idle.length === 0) NativeScriptSessions.idle.delete(this.key);
       return pooled;
     }
-    const pooled = new PooledSession(new JSScriptSessionOptions());
+    const sessionOptions = new JSScriptSessionOptions();
+    // 单次宿主调用最长等待：browser.verify 要等用户在网页里操作；普通请求由各自的网络超时控制。
+    sessionOptions.hostTimeoutMs = NativeScriptSessions.HOST_WAIT_MS;
+    const pooled = new PooledSession(sessionOptions);
     const prelude = await pooled.session.evaluate(NativeJsPrelude.source(NativeExpr.scriptBuiltinNames(), true),
       'native-prelude.js', NativeScriptSessions.LOAD_CPU_MS);
     const loaded = prelude.success ?

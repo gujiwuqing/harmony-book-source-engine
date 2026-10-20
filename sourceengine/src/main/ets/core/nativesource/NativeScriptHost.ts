@@ -15,9 +15,10 @@ export type NativeScriptCallHandler = (name: string, args: NativeValue[]) => Pro
 export interface NativeScriptRunOptions {
   /** 脚本自身的计算时间上限，不含等待宿主的时间。 */
   cpuMs: number;
-  /** 从开始到结束的总时长上限。 */
+  /** 从开始到结束的总时长上限，不含等用户在网页里操作的时间（pausedMs）。 */
   wallMs: number;
   cancelled: () => boolean;
+  pausedMs?: () => number;
 }
 
 /** 在后台运行书源 js 里的函数 fn(ctx)：真机是 QuickJS 后台会话，Node 回归是 worker。 */
@@ -60,10 +61,16 @@ export interface NativeScriptContext {
   saveCredential: (token: string, user: string) => Promise<void>;
   /** 详情阶段用来收集 keep()；其他阶段为 null。 */
   keep: Record<string, string> | null;
+  /**
+   * 用户主动发起的操作（打开书籍的详情、目录、正文，设置页按钮，登录）：可以弹出网页。
+   * 搜索、发现是多个书源同时跑的，不弹网页，browser.verify 改走「去验证」。
+   */
+  interactive: boolean;
 }
 
 const BATCH = 8;
 const MAX_SLEEP_MS = 5000;
+const NOT_INTERACTIVE = '搜索和发现时不能打开网页';
 const DEFAULT_CACHE_TTL = 600;
 const MAX_CACHE_TTL = 7 * 24 * 3600;
 
@@ -71,6 +78,7 @@ export class NativeScriptHost {
   private context: NativeScriptContext;
   private requests: number = 0;
   private bytes: number = 0;
+  private paused: number = 0;
 
   constructor(context: NativeScriptContext) {
     this.context = context;
@@ -78,6 +86,11 @@ export class NativeScriptHost {
 
   get requestCount(): number {
     return this.requests;
+  }
+
+  /** 等用户在网页里操作的总时长，不计入脚本的总时长预算。 */
+  get pausedMs(): number {
+    return this.paused;
   }
 
   /** 交给脚本引擎的处理函数。 */
@@ -138,6 +151,27 @@ export class NativeScriptHost {
           setTimeout((): void => resolve(null), ms);
         });
       }
+      case '@toast': {
+        const host = this.context.host;
+        if (!host.toast) throw new Error('当前环境不支持提示');
+        host.toast(this.text(args[0]));
+        return null;
+      }
+      case '@refreshExplore': {
+        const host = this.context.host;
+        if (!host.refreshExplore) throw new Error('当前环境不支持刷新发现页');
+        return host.refreshExplore().then((): NativeValue => null);
+      }
+      case '@browserVerify':
+        return this.browserVerify(this.url(args[0]), this.text(args[1]));
+      case '@browserOpen': {
+        const host = this.context.host;
+        if (!this.context.interactive) throw new Error(NOT_INTERACTIVE);
+        if (!host.openBrowser) throw new Error('当前环境不支持打开网页');
+        return host.openBrowser(this.url(args[0]), this.text(args[1]), false).then((): NativeValue => null);
+      }
+      case '@render':
+        return this.render(this.url(args[0]), args[1]);
       case '@device': {
         const host = this.context.host;
         if (this.text(args[0]) === 'ua') return host.userAgent ? host.userAgent() : '';
@@ -146,6 +180,41 @@ export class NativeScriptHost {
       default:
         throw new Error(`没有这个宿主接口：${name.substring(1)}`);
     }
+  }
+
+  /** 交互场景里打开网页等用户完成，返回页面；非交互场景提示「去验证」。 */
+  private async browserVerify(url: string, hint: string): Promise<NativeValue> {
+    if (!/^https?:/i.test(url)) throw new Error(`网页地址无效：${url}`);
+    const host = this.context.host;
+    if (!this.context.interactive) {
+      if (host.requestVerification) host.requestVerification(url, hint || '网页验证');
+      throw new Error(`需要网页验证${hint ? `（${hint}）` : ''}，请点「去验证」后重试`);
+    }
+    if (!host.openBrowser) throw new Error('当前环境不支持打开网页');
+    const startedAt = Date.now();
+    this.trace(`browser.verify ${url}`, '等待用户在网页里完成', '');
+    try {
+      const result = await host.openBrowser(url, hint, true);
+      if (result.error) throw new Error(result.error);
+      return result.body;
+    } finally {
+      this.paused += Date.now() - startedAt;
+    }
+  }
+
+  /** 在内置浏览器里加载页面并执行注入的表达式，返回结果（对象会转成 JSON 文本）。 */
+  private async render(url: string, raw: NativeValue): Promise<NativeValue> {
+    const options: Record<string, NativeValue> = raw && typeof raw === 'object' && !Array.isArray(raw) ?
+      raw as Record<string, NativeValue> : {};
+    const request = this.request({
+      url: url, headers: options['headers'],
+      webView: { waitFor: options['waitFor'] || '', timeout: options['timeout'] }
+    });
+    request.webJs = this.text(options['js']).trim();
+    this.count(1);
+    const response = await this.fetch(request) as Record<string, NativeValue>;
+    if (!response['ok']) throw new Error(`网页渲染失败：${response['error'] || `HTTP ${response['status']}`}`);
+    return response['body'];
   }
 
   private async http(raw: NativeValue): Promise<NativeValue> {

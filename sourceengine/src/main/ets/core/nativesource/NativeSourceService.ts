@@ -30,12 +30,14 @@ import { VerificationSupport } from '../http/VerificationSupport';
 import { ReaderActionMarker } from '../book/ReaderActionMarker';
 import type { NativeLoginSpec, NativeSourceDefinition, NativeVarSpec, NativeVoiceSpec } from './NativeSourceSpec';
 import type {
-  NativeActionEntry, NativeLoginCredential, NativeLoginResult, NativeLoginState, NativeRuleTrace
+  NativeActionEntry, NativeLoginCredential, NativeLoginResult, NativeLoginState, NativeRuleTrace, NativeVarOptions
 } from './NativeSourceRunner';
 import type { NativeLoginFieldSpec } from './NativeSourceSpec';
 import { NetworkErrorText } from '../http/NetworkErrorText';
 import { NativeSourceImport } from './NativeSourceImport';
 import { NativeScriptSessions } from './NativeScriptSessions';
+import { NativeSourceInteraction } from './NativeSourceInteraction';
+import type { NativeBrowserResult } from './NativeSourceInteraction';
 import type { NativeScriptEngine } from './NativeScriptHost';
 import { BookSourceRuntimeStore } from '../book/BookSourceRuntimeStore';
 import { deviceInfo } from '@kit.BasicServicesKit';
@@ -98,10 +100,17 @@ class NativeHost implements NativeRunnerHost {
     analyzeUrl.parse(url);
     const webRequest = analyzeUrl.buildRequest();
     webRequest.useWebView = true;
-    webRequest.webJs = `(function(){return document.querySelector(${JSON.stringify(request.webWaitFor)})` +
-      `?document.documentElement.outerHTML:'';})()`;
-    webRequest.webJsAcceptPattern = '\\S';
-    webRequest.webJsMaxAttempts = Math.max(4, request.webTimeout * 2);
+    // 脚本的 browser.render 带了 js：在页面里求值注入的表达式（对象转成 JSON 文本）；没有 waitFor 时只求值一次。
+    const result = request.webJs ?
+      `var __r=(${request.webJs});return __r===undefined||__r===null?'':(typeof __r==='string'?__r:JSON.stringify(__r));` :
+      'return document.documentElement.outerHTML;';
+    webRequest.webJs = request.webWaitFor ?
+      `(function(){if(!document.querySelector(${JSON.stringify(request.webWaitFor)}))return '';${result}})()` :
+      `(function(){${result}})()`;
+    if (request.webWaitFor) {
+      webRequest.webJsAcceptPattern = '\\S';
+      webRequest.webJsMaxAttempts = Math.max(4, request.webTimeout * 2);
+    }
     webRequest.readTimeout = request.webTimeout * 1000;
     webRequest.debugContext = this.debugContext || undefined;
     if (this.maxResponseBytes > 0) webRequest.maxResponseBytes = this.maxResponseBytes;
@@ -120,7 +129,7 @@ class NativeHost implements NativeRunnerHost {
     if (request.retry > 0) options['retry'] = request.retry;
     const url = Object.keys(options).length > 0 ? `${request.url},${JSON.stringify(options)}` : request.url;
     const analyzeUrl = new AnalyzeUrl(this.source, this.http).setCancelCheck(this.cancelled);
-    const response = request.webView && request.webWaitFor ?
+    const response = request.webView && (request.webWaitFor || request.webJs) ?
       await this.fetchWaitingFor(analyzeUrl, url, request) :
       await analyzeUrl.fetch(url, this.maxResponseBytes > 0 ? this.maxResponseBytes : undefined, this.debugContext);
     // 没拿到响应且请求层报的是明确的网络错误（域名解析、超时、连不上等）：与登录无关，直接给出真实原因。
@@ -197,6 +206,32 @@ class NativeHost implements NativeRunnerHost {
 
   async saveCredential(token: string, user: string): Promise<void> {
     await NativeSourceService.saveRuntime(this.source, null, NativeSourceService.loginInfoWith(this.source, token, user));
+  }
+
+  toast(message: string): void {
+    const handler = NativeSourceInteraction.handler();
+    if (!handler) throw new Error('当前环境不支持提示');
+    handler.toast(this.source.bookSourceName || '', message);
+  }
+
+  async refreshExplore(): Promise<void> {
+    const handler = NativeSourceInteraction.handler();
+    if (!handler) throw new Error('当前环境不支持刷新发现页');
+    NativeSourceService.clearCache(this.source.bookSourceUrl);
+    await handler.refreshExplore(this.source.bookSourceUrl);
+  }
+
+  async openBrowser(url: string, title: string, wait: boolean): Promise<NativeBrowserResult> {
+    const handler = NativeSourceInteraction.handler();
+    if (!handler) return { body: '', error: '当前环境不支持打开网页' };
+    return await handler.openBrowser({
+      url: url, title: title || this.source.bookSourceName || '网页',
+      sourceUrl: this.source.bookSourceUrl, sourceName: this.source.bookSourceName || ''
+    }, wait);
+  }
+
+  requestVerification(url: string, title: string): void {
+    VerificationSupport.requestVerification(url, title, this.source);
   }
 
   deviceId(): string {
@@ -486,7 +521,12 @@ export class NativeSourceService {
     const stored = NativeSourceService.storedVars(source);
     if (String(stored[target.key] === undefined ? '' : stored[target.key]) === selection) return '';
     stored[target.key] = selection;
-    return JSON.stringify(stored);
+    // 调用方接着会保存这个结果：之后以它为准，不能再让脚本先前写入的值盖过发现页的选择。
+    const state = NativeSourceService.runtimeState.get(source.bookSourceUrl);
+    if (state) state.variable = null;
+    const variable = JSON.stringify(stored);
+    source.variable = variable;
+    return variable;
   }
 
   private static runner(source: BookSource, http: HttpClient, cancelled: () => boolean,
@@ -532,7 +572,12 @@ export class NativeSourceService {
 
   static loginForm(source: BookSource): NativeLoginFieldSpec[] {
     const login = NativeSourceService.loginSpec(source);
-    return login && login.submit && Array.isArray(login.form) ? login.form : [];
+    return login && (login.submit || login.script) && Array.isArray(login.form) ? login.form : [];
+  }
+
+  /** 书源设置页的动态选项（vars 里写了 optionsScript 的变量）。 */
+  static async varOptions(source: BookSource, http: HttpClient): Promise<Record<string, NativeVarOptions>> {
+    return await NativeSourceService.runner(source, http, (): boolean => false).varOptions();
   }
 
   static async submitLogin(source: BookSource, http: HttpClient,

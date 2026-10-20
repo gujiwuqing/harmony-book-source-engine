@@ -60,7 +60,7 @@ export function createNodeScriptEngine(NativeJsPrelude, builtinNames, code) {
         };
         const timer = setInterval(() => {
           if (options.cancelled()) finish(() => reject(new Error('已取消')));
-          else if (Date.now() - startedAt > options.wallMs) {
+          else if (Date.now() - startedAt - (options.pausedMs ? options.pausedMs() : 0) > options.wallMs) {
             finish(() => reject(new Error(`运行超过 ${Math.round(options.wallMs / 1000)} 秒`)));
           }
         }, 10);

@@ -129,6 +129,19 @@ ${script ? NativeJsPrelude.SCRIPT_API : NativeJsPrelude.EXPRESSION_STUBS}
     }).join(' ')]);
   });
   define('sleep', function (ms) { call('@sleep', [Number(ms) || 0]); });
+  define('ui', Object.freeze({
+    toast: function (message) { call('@toast', [message === undefined || message === null ? '' : String(message)]); },
+    refreshExplore: function () { call('@refreshExplore', []); }
+  }));
+  define('browser', Object.freeze({
+    verify: function (url, hint) {
+      return call('@browserVerify', [String(url), hint === undefined || hint === null ? '' : String(hint)]);
+    },
+    open: function (url, title) {
+      call('@browserOpen', [String(url), title === undefined || title === null ? '' : String(title)]);
+    },
+    render: function (url, options) { return call('@render', [String(url), options || {}]); }
+  }));
   define('page', function (body, url) {
     return { __nativePage: true, body: body === undefined || body === null ? '' : String(body),
       url: url === undefined || url === null ? '' : String(url) };
@@ -137,7 +150,7 @@ ${script ? NativeJsPrelude.SCRIPT_API : NativeJsPrelude.EXPRESSION_STUBS}
   /** 表达式环境里的同名占位：规则在主线程同步求值，不能等网络，也不应改动状态。 */
   private static readonly EXPRESSION_STUBS: string = `
   var refuse = function () { throw new Error('表达式里不能发请求或读写状态，请改用阶段的 script'); };
-  ['http', 'vars', 'temp', 'cache', 'cookie', 'login', 'device'].forEach(function (name) {
+  ['http', 'vars', 'temp', 'cache', 'cookie', 'login', 'device', 'ui', 'browser'].forEach(function (name) {
     define(name, new Proxy({}, {
       get: function (target, key) {
         if (typeof key !== 'string' || key === 'toJSON' || key === 'then') return undefined;

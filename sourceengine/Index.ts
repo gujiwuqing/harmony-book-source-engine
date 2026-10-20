@@ -144,8 +144,15 @@ export {
   NativeContentLink,
   NativeImageDecode,
   NativeSourceError,
-  NativeSourceRunner
+  NativeSourceRunner,
+  NativeVarOptions
 } from './src/main/ets/core/nativesource/NativeSourceRunner';
+export {
+  NativeBrowserRequest,
+  NativeBrowserResult,
+  NativeSourceInteraction,
+  NativeSourceInteractionHandler
+} from './src/main/ets/core/nativesource/NativeSourceInteraction';
 export {
   NativeFilterGroup,
   NativeVoiceOption,

@@ -56,6 +56,17 @@ function scriptHost(respond) {
   host.saveCredential = async (token, user) => { host.saved.credential = { token, user }; };
   host.deviceId = () => 'odid-test';
   host.userAgent = () => 'UA-test';
+  // 界面端口：记下调用，browser 按 host.browserAnswer 返回。
+  host.ui = { toasts: [], refreshed: 0, opened: [], verifications: [] };
+  host.browserAnswer = { body: '<html>验证后的页面</html>', error: '' };
+  host.toast = (message) => { host.ui.toasts.push(message); };
+  host.refreshExplore = async () => { host.ui.refreshed++; };
+  host.openBrowser = async (url, title, wait) => {
+    host.ui.opened.push({ url, title, wait });
+    if (wait) await sleep(30);
+    return wait ? host.browserAnswer : { body: '', error: '' };
+  };
+  host.requestVerification = (url, title) => { host.ui.verifications.push({ url, title }); };
   return host;
 }
 
@@ -278,6 +289,98 @@ try {
   equal(NativeSourceSpec.scriptFunctions(stateSource), ['detail', 'toc'], '列出阶段 script 用到的函数');
   equal(NativeJsPrelude.missingMessage(['detail', 'toc'], ['detail']), 'js 里没有阶段 script 用到的函数 “toc”',
     '导入检查：缺少函数');
+
+  // ---------- 阶段 3：提示、刷新、网页、按钮、动态选项、脚本登录 ----------
+  const uiSource = define({
+    ...base,
+    vars: [{ key: 'line', label: '线路', options: ['甲'], default: '甲', optionsScript: 'lines' },
+      { key: 'bad', label: '坏选项', options: ['默认'], optionsScript: 'brokenLines' }],
+    js: `
+      function search(ctx) { return [{ name: browser.verify('/verify', '过一下验证'), bookUrl: '/x' }]; }
+      function detail(ctx) {
+        ui.toast('详情来了');
+        var page = browser.verify('/verify', '过一下验证');
+        browser.open('/help', '说明');
+        var rendered = browser.render('/spa', { js: 'document.title', waitFor: '#app' });
+        return { name: page.length + ':' + rendered, kind: ctx.stage };
+      }
+      function exploreOpen(ctx) { browser.open('/help'); return []; }
+      function switchLine(ctx) { vars.set('line', '乙'); ui.refreshExplore(); return '已切换到' + vars.get('line') + '（' + ctx.action + '）'; }
+      function failing() { throw new Error('按钮坏了'); }
+      function lines(ctx) { return ['甲', '乙', '丙'].concat([ctx.key]); }
+      function brokenLines() { throw new Error('测速失败'); }
+      function doLogin(ctx) {
+        if (ctx.form.pass !== 'secret') return { ok: false, message: '密码不对' };
+        login.save('tok-' + ctx.form.user, ctx.form.user);
+        return '欢迎 ' + ctx.form.user;
+      }
+      function sendCode(ctx) { return '验证码已发到 ' + ctx.form.user; }
+    `,
+    search: { script: 'search' },
+    explore: { menus: [{ title: '打开说明', url: 'x' }], script: 'exploreOpen' },
+    detail: { script: 'detail' },
+    actions: [{ label: '切换线路', script: 'switchLine' }, { label: '坏按钮', script: 'failing' }],
+    login: {
+      form: [{ key: 'user', label: '账号' }, { key: 'pass', label: '密码', secret: true }],
+      script: 'doLogin',
+      sendCode: { label: '发验证码', script: 'sendCode' },
+    },
+  });
+  host = scriptHost(async (request) => (request.url.includes('/spa') ? 'SPA 标题' : null));
+  const uiDetail = await new NativeSourceRunner(uiSource, host, {}).detail(book);
+  equal(uiDetail.name, '19:SPA 标题', '详情（交互场景）里 browser.verify 拿回页面，browser.render 返回注入表达式的结果');
+  equal(host.ui.toasts, ['详情来了'], 'ui.toast');
+  equal(host.ui.opened.map((o) => [o.url, o.wait]), [['https://api.example.com/verify', true],
+    ['https://api.example.com/help', false]], 'verify 等待、open 不等待，地址按书源补全');
+  const rendered = host.requests.find((r) => r.url.includes('/spa'));
+  equal([rendered.webView, rendered.webWaitFor, rendered.webJs], [true, '#app', 'document.title'], 'render 走网页渲染并带上注入的表达式');
+  equal(host.traces.some((t) => t.type === 'script' && /^browser\.verify/.test(t.rule)), true, '等待网页记入调试记录');
+
+  host = scriptHost(respond);
+  await rejects(new NativeSourceRunner(uiSource, host, {}).search('a', 1), /需要网页验证（过一下验证），请点「去验证」后重试/,
+    '搜索（非交互）里 browser.verify 不弹网页');
+  equal([host.ui.opened.length, host.ui.verifications.map((v) => v.url)], [0, ['https://api.example.com/verify']],
+    '改走应用的「去验证」');
+  await rejects(new NativeSourceRunner(uiSource, scriptHost(respond), {}).explore('native:menu:0', 1), /搜索和发现时不能打开网页/,
+    '发现里不能 browser.open');
+  host = scriptHost(respond);
+  host.browserAnswer = { body: '', error: '网页操作已取消' };
+  await rejects(new NativeSourceRunner(uiSource, host, {}).detail(book), /网页操作已取消/, '用户取消网页时脚本得到原因');
+  const noUi = scriptHost(respond);
+  delete noUi.toast;
+  await rejects(new NativeSourceRunner(uiSource, noUi, {}).detail(book), /当前环境不支持提示/, '没有界面端口时明确报错');
+
+  host = scriptHost(respond);
+  const uiRunner = new NativeSourceRunner(uiSource, host, { line: '甲' });
+  equal((await uiRunner.actions()).map((a) => a.label), ['切换线路', '坏按钮'], '脚本按钮列在设置页');
+  equal(await uiRunner.runAction(0), '已切换到乙（切换线路）', '按钮脚本：改变量、刷新发现页、返回提示');
+  equal([host.saved.vars.line, host.ui.refreshed], ['乙', 1], '按钮改的变量已保存，发现页已刷新');
+  // 真机的 QuickJS 报错带“Error: ”前缀，Node 的 worker 不带，两种都接受。
+  const failedAction = (await uiRunner.runAction(1)).replace('Error: ', '');
+  equal(failedAction, '操作失败：按钮坏了', '按钮脚本出错时给出原因');
+  const options = await uiRunner.varOptions();
+  options.bad.error = options.bad.error.replace('Error: ', '');
+  equal(options, {
+    line: { options: ['甲', '乙', '丙', 'line'], error: '' },
+    bad: { options: [], error: '测速失败' },
+  }, '动态选项：成功给出列表，失败给出原因');
+
+  host = scriptHost(respond);
+  const wrong = await new NativeSourceRunner(uiSource, host, {}).submitLogin({ user: '小明', pass: 'nope' });
+  equal([wrong.ok, wrong.message, host.saved.credential], [false, '密码不对', null], '脚本登录失败');
+  const right = await new NativeSourceRunner(uiSource, host, {}).submitLogin({ user: '小明', pass: 'secret' });
+  equal([right.ok, right.token, right.user, right.message], [true, 'tok-小明', '小明', '欢迎 小明'], '脚本登录成功');
+  equal(host.saved.credential, { token: 'tok-小明', user: '小明' }, '凭据经 login.save 保存');
+  equal(await new NativeSourceRunner(uiSource, host, {}).sendLoginCode({ user: '小明' }), '验证码已发到 小明',
+    '发送验证码也可以用脚本，拿得到表单');
+
+  equal(NativeSourceSpec.scriptFunctions(uiSource),
+    ['search', 'exploreOpen', 'detail', 'switchLine', 'failing', 'lines', 'brokenLines', 'doLogin', 'sendCode'],
+    '导入检查覆盖阶段、按钮、动态选项、登录与验证码');
+  invalid((o) => { o.actions = [{ label: '坏', script: '1x' }]; }, /actions\[0\]\.script 必须是 js 里的函数名/, '按钮脚本名不合法');
+  invalid((o) => { o.login = { script: 'login-x' }; }, /login\.script 必须是 js 里的函数名/, '登录脚本名不合法');
+  equal(NativeSourceSpec.validate(define({ ...base, js: 'function s() {}', actions: [{ label: '只有脚本', script: 's' }],
+    login: { script: 's' } })), [], '只写 script 的按钮和登录是合法的');
 
   console.log(`Native script stage check passed: ${assertions} assertions.`);
 } finally {
