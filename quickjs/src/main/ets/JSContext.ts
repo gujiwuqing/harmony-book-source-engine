@@ -96,6 +96,15 @@ export class JSContext {
     return result;
   }
 
+  /**
+   * Exposes `__host(name, payload)` to scripts. The handler runs synchronously on this thread while the
+   * script waits; a thrown error becomes a catchable script error. Only use with evaluate calls made
+   * from the thread that created this context.
+   */
+  setHostFunction(handler: (name: string, payload: string) => string): boolean {
+    return qjs.engineSetHost(this._engineHandle, handler);
+  }
+
   setObject(object: Record<string, Object> | JSValue, name: string): void {
     if (object instanceof JSValue) {
       const globalObj = this.globalObject;

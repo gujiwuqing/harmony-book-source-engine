@@ -5,9 +5,9 @@
  */
 
 import { CooperativeScheduler } from '../concurrency/CooperativeScheduler';
-import { NativeExpr, NativeScope } from './NativeExpr';
+import { NativeExpr, NativeExprError, NativeScope } from './NativeExpr';
 import { SourceCoverUrl } from './SourceCoverUrl';
-import type { NativeExprHost, NativeValue } from './NativeExpr';
+import type { NativeExprHost, NativeScriptLibrary, NativeValue } from './NativeExpr';
 import type {
   NativeActionSpec, NativeCommentsSpec, NativeContentSpec, NativeFetchSpec, NativeMenuSpec, NativeRequestSpec,
   NativeSourceDefinition, NativeStageSpec, NativeTocSpec
@@ -83,6 +83,8 @@ export interface NativeRunnerHost extends NativeExprHost {
   cachePut?(key: string, value: NativeValue, ttlSeconds: number): void;
   /** 按列表规则取出元素：JSON 元素返回对象，HTML 元素返回外层 HTML 文本。 */
   selectItems(content: string, rule: string, baseUrl: string): NativeValue[];
+  /** 书源 js 字段的执行器；不提供时调用 JS 函数会报“不支持”。 */
+  scriptLibrary?(code: string): NativeScriptLibrary;
 }
 
 export interface NativeBookRecord {
@@ -249,8 +251,21 @@ export class NativeSourceRunner {
   constructor(definition: NativeSourceDefinition, host: NativeRunnerHost, storedVars: Record<string, NativeValue> = {}) {
     this.definition = definition;
     this.host = host;
-    this.expr = new NativeExpr(host).loadLibrary(definition.lib);
+    this.expr = new NativeExpr(host).loadLibrary(definition.lib).loadScript(NativeSourceRunner.scriptOf(definition, host));
     this.varValues = NativeSourceRunner.resolveVars(definition, storedVars);
+  }
+
+  private static scriptOf(definition: NativeSourceDefinition, host: NativeRunnerHost): NativeScriptLibrary | null {
+    const code = definition.js || '';
+    if (!code.trim()) return null;
+    if (host.scriptLibrary) return host.scriptLibrary(code);
+    // 宿主没有脚本引擎时，调用 JS 函数给出明确原因，而不是“没有这个内置函数”。
+    return {
+      has: (): boolean => true,
+      call: (name: string): NativeValue => {
+        throw new NativeExprError(`当前环境不支持 JS 函数库，无法调用 “${name}”`);
+      }
+    };
   }
 
   /** 表单登录保存下来的凭据，规则里通过 login.token / login.user 读取。 */

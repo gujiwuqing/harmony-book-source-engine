@@ -1,6 +1,34 @@
 import { JSScriptEvalResult, JSScriptSession, JSScriptSessionOptions } from '@devzeng/quickjs';
 import { HttpClient } from '../http/HttpClient';
+import { digestHashHex } from '../http/DigestHash';
 import { AnalyzeRule } from '../rule/AnalyzeRule';
+import { JsonPathEvaluator } from '../rule/JsonPathEvaluator';
+import { NativeExpr, NativeScope } from '../nativesource/NativeExpr';
+import type { NativeExprHost, NativeValue } from '../nativesource/NativeExpr';
+import { NativeJsLibrary } from '../nativesource/NativeJsLibrary';
+import { NativeSourceCrypto } from '../nativesource/NativeSourceCrypto';
+
+/** JS 函数库验证用的表达式宿主：与原生书源运行时相同的选择器、摘要和加解密实现。 */
+class ProbeExprHost implements NativeExprHost {
+  jsonPath(root: NativeValue, path: string): NativeValue[] {
+    return JsonPathEvaluator.evaluate(root as Object, path);
+  }
+
+  select(content: string, rule: string, baseUrl: string, list: boolean): string[] {
+    const analyzer = new AnalyzeRule(content, baseUrl);
+    if (list) return analyzer.getStringList(rule);
+    const value = analyzer.getString(rule);
+    return value ? [value] : [];
+  }
+
+  digest(algorithm: string, text: string): string {
+    return digestHashHex(algorithm, text);
+  }
+
+  crypto(name: string, args: NativeValue[]): NativeValue {
+    return NativeSourceCrypto.run(name, args as Object[]);
+  }
+}
 
 export class ScriptProbeResult {
   name: string = '';
@@ -37,6 +65,11 @@ export class ScriptThreadProbe {
       ['4 个会话并行', () => ScriptThreadProbe.parallelSessions()],
       ['运行中释放会话', () => ScriptThreadProbe.releaseWhileBusy()],
       ['反复创建与释放 30 个会话', () => ScriptThreadProbe.churn()],
+      ['JS 函数库：表达式调用与 native 回调', () => ScriptThreadProbe.jsLibraryCall()],
+      ['JS 函数库：逐章式连续调用', () => ScriptThreadProbe.jsLibraryThroughput()],
+      ['JS 函数库：超时与报错', () => ScriptThreadProbe.jsLibraryErrors()],
+      ['JS 函数库：导入检查', () => ScriptThreadProbe.jsLibraryCheck()],
+      ['JS 函数库：大代码载入与缓存淘汰', () => ScriptThreadProbe.jsLibraryLoad()],
     ];
     for (const entry of cases) {
       let result: ScriptProbeResult;
@@ -260,6 +293,116 @@ export class ScriptThreadProbe {
       session.release();
     }
     return ScriptThreadProbe.result(ok === 30, `${ok}/30 正常，共 ${Date.now() - startedAt} ms`);
+  }
+
+  private static jsExpr(code: string): NativeExpr {
+    // 代码里带时间戳，每次验证都重新载入，不复用上一次留下的全局变量。
+    return new NativeExpr(new ProbeExprHost()).loadScript(NativeJsLibrary.forCode(`// probe ${Date.now()}\n${code}`));
+  }
+
+  private static async jsLibraryCall(): Promise<ScriptProbeResult> {
+    const expr = ScriptThreadProbe.jsExpr('function sign(p) { return native.md5(p).slice(0, 8); }\n' +
+      "const title = () => native.sel('@css:h1@text');\n" +
+      "function shape() { return { a: [1, '二'], b: null }; }\n" +
+      'function viaBytes(t) { return native.bytesBase64(native.bytes(t)); }');
+    const scope = new NativeScope().set('item', '<div><h1>斗破</h1></div>').set('baseUrl', '');
+    const startedAt = Date.now();
+    const signed: NativeValue = expr.evaluate("sign('abc')", scope);
+    const loadMs = Date.now() - startedAt;
+    const expected: NativeValue = expr.evaluate("substring(md5('abc'), 0, 8)", scope);
+    const title: NativeValue = expr.evaluate('title()', scope);
+    const shape = JSON.stringify(expr.evaluate('shape()', scope));
+    const bytes = expr.evaluate("viaBytes('中文😀')", scope) === expr.evaluate("bytesBase64(bytes('中文😀'))", scope);
+    const ok = signed === expected && title === '斗破' && shape === '{"a":[1,"二"],"b":null}' && bytes;
+    return ScriptThreadProbe.result(ok,
+      `签名 ${signed}（应为 ${expected}），标题 ${title}，对象 ${shape}，字节往返 ${bytes}；首次调用含载入 ${loadMs} ms`);
+  }
+
+  private static async jsLibraryThroughput(): Promise<ScriptProbeResult> {
+    const expr = ScriptThreadProbe.jsExpr('function twice(x) { return x * 2; }\n' +
+      'function hashed(x) { return native.md5(String(x)); }');
+    const scope = new NativeScope();
+    expr.evaluate('twice(0)', scope);
+    let wrong = 0;
+    let startedAt = Date.now();
+    for (let i = 0; i < 2000; i++) {
+      if (expr.evaluate('twice(n)', scope.set('n', i)) !== i * 2) wrong++;
+    }
+    const plainMs = Date.now() - startedAt;
+    startedAt = Date.now();
+    for (let i = 0; i < 500; i++) {
+      if (expr.evaluate('hashed(n)', scope.set('n', i)) !== expr.evaluate('md5(str(n))', scope)) wrong++;
+    }
+    const nativeMs = Date.now() - startedAt;
+    const averageMicros = Math.round(plainMs * 1000 / 2000);
+    return ScriptThreadProbe.result(wrong === 0 && plainMs < 2000,
+      `2000 次纯 JS 调用 ${plainMs} ms（平均 ${averageMicros} 微秒）；` +
+        `500 次带 native.md5 的调用 ${nativeMs} ms（含对照计算）；错误 ${wrong} 次`);
+  }
+
+  private static async jsLibraryErrors(): Promise<ScriptProbeResult> {
+    const expr = ScriptThreadProbe.jsExpr('function spin() { for (;;) {} }\n' +
+      "function boom() { throw new Error('坏了'); }\n" +
+      'function bad() { return native.nope(); }\n' +
+      'function twice(x) { return x * 2; }');
+    const scope = new NativeScope();
+    const failure = (source: string): string => {
+      try {
+        expr.evaluate(source, scope);
+        return '';
+      } catch (e) {
+        return (e as Error).message;
+      }
+    };
+    const startedAt = Date.now();
+    const spin = failure('spin()');
+    const spinMs = Date.now() - startedAt;
+    const boom = failure('boom()');
+    const bad = failure('bad()');
+    const after: NativeValue = expr.evaluate('twice(21)', scope);
+    const ok = /300 ms/.test(spin) && spinMs < 1500 && /boom/.test(boom) && /坏了/.test(boom) && /bad/.test(bad) &&
+      after === 42;
+    return ScriptThreadProbe.result(ok,
+      `死循环：${spin}（${spinMs} ms）；抛错：${boom}；未知 native：${ScriptThreadProbe.firstLine(bad)}；之后再调用得到 ${after}`);
+  }
+
+  private static async jsLibraryCheck(): Promise<ScriptProbeResult> {
+    const clash = NativeJsLibrary.check('function md5(x) { return x; }', []);
+    const libClash = NativeJsLibrary.check('function sign() { return 1; }', ['sign']);
+    const syntax = NativeJsLibrary.check('function (', []);
+    const topLevel = NativeJsLibrary.check("var x = native.md5('a');", []);
+    const good = NativeJsLibrary.check('const ok = () => 1;', []);
+    const ok = /内置函数重名/.test(clash) && /lib/.test(libClash) && /^js：/.test(syntax) && /顶层/.test(topLevel) &&
+      good === '';
+    return ScriptThreadProbe.result(ok,
+      `重名：${clash}；与 lib 重名：${libClash}；语法错误：${ScriptThreadProbe.firstLine(syntax)}；` +
+        `顶层调用 native：${ScriptThreadProbe.firstLine(topLevel)}；正常代码：${good || '通过'}`);
+  }
+
+  private static async jsLibraryLoad(): Promise<ScriptProbeResult> {
+    const parts: string[] = [];
+    for (let i = 0; i < 3000; i++) {
+      parts.push(`function f${i}(x) { var t = [${i}, ${i + 1}, ${i + 2}]; return x + t[0] + t.length; }`);
+    }
+    const code = parts.join('\n');
+    const big = ScriptThreadProbe.jsExpr(code);
+    const scope = new NativeScope();
+    let startedAt = Date.now();
+    const first: NativeValue = big.evaluate('f2999(1)', scope);
+    const loadMs = Date.now() - startedAt;
+    startedAt = Date.now();
+    const second: NativeValue = big.evaluate('f10(1)', scope);
+    const warmMs = Date.now() - startedAt;
+    for (let i = 0; i < 5; i++) {
+      ScriptThreadProbe.jsExpr(`function other${i}() { return ${i}; }`).evaluate(`other${i}()`, scope);
+    }
+    startedAt = Date.now();
+    const reloaded: NativeValue = big.evaluate('f2999(2)', scope);
+    const reloadMs = Date.now() - startedAt;
+    const ok = first === 3003 && second === 14 && reloaded === 3004;
+    return ScriptThreadProbe.result(ok,
+      `约 ${Math.round(code.length / 1024)} KB 代码首次载入并调用 ${loadMs} ms，之后单次 ${warmMs} ms；` +
+        `被挤出缓存后重新载入 ${reloadMs} ms，结果 ${first}/${second}/${reloaded}`);
   }
 
   private static newSession(options?: JSScriptSessionOptions): JSScriptSession {

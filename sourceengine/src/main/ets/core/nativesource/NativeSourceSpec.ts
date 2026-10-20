@@ -8,6 +8,7 @@
  */
 
 import { NativeExpr } from './NativeExpr';
+import { NativeJsPrelude } from './NativeJsPrelude';
 import type { NativeValue } from './NativeExpr';
 
 export interface NativeVarSpec {
@@ -238,6 +239,8 @@ export interface NativeSourceDefinition {
   vars?: NativeVarSpec[];
   /** 函数库：用 fn 定义的纯计算函数，供表达式调用。 */
   lib?: string;
+  /** JS 函数库：顶层定义的函数可在表达式里按名调用，函数里通过 native.名称 使用内置函数。只做纯计算。 */
+  js?: string;
   login?: NativeLoginSpec;
   /** 可选的听书音色。用户在听书页选中的 id 存在书籍变量里，规则通过 book.vars.custom 读取。 */
   voices?: NativeVoiceSpec[];
@@ -389,6 +392,11 @@ export class NativeSourceSpec {
     } else if (definition.lib) {
       const problem = NativeExpr.checkLibrary(definition.lib);
       if (problem) errors.push(`lib：${problem}`);
+    }
+    if (definition.js !== undefined && typeof definition.js !== 'string') {
+      errors.push('js 必须是字符串');
+    } else if (definition.js && definition.js.length > NativeJsPrelude.MAX_CODE_LENGTH) {
+      errors.push(`js 太长：上限 ${Math.round(NativeJsPrelude.MAX_CODE_LENGTH / 1024)} KB`);
     }
     if (definition.voices !== undefined) {
       if (!Array.isArray(definition.voices)) {

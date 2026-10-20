@@ -14,7 +14,9 @@ import { RuleExecutionTarget, RuleValue, RuleValueKind } from '../rule/RuleValue
 import { BookTypeSupport } from '../book/BookTypeSupport';
 import { BookUrlResolver } from '../book/BookUrlResolver';
 import { BookFieldSanitizer } from '../../utils/BookFieldSanitizer';
-import type { NativeValue } from './NativeExpr';
+import { NativeExpr } from './NativeExpr';
+import type { NativeScriptLibrary, NativeValue } from './NativeExpr';
+import { NativeJsLibrary } from './NativeJsLibrary';
 import { NativeSourceRunner } from './NativeSourceRunner';
 import { SourceCoverUrl } from './SourceCoverUrl';
 import type {
@@ -160,6 +162,10 @@ class NativeHost implements NativeRunnerHost {
     return value ? [value] : [];
   }
 
+  scriptLibrary(code: string): NativeScriptLibrary {
+    return NativeJsLibrary.forCode(code);
+  }
+
   selectItems(content: string, rule: string, baseUrl: string): NativeValue[] {
     const values = new AnalyzeRule(content, baseUrl).execute(rule, RuleExecutionTarget.ELEMENTS);
     return values.map((value: RuleValue): NativeValue => {
@@ -268,7 +274,12 @@ export class NativeSourceService {
 
   /** 导入用：把 JSON 对象转成书源记录，不合法时抛出带原因的错误。 */
   static importObject(value: Object, existing: BookSource | null = null): BookSource {
-    return NativeSourceService.toBookSource(NativeSourceSpec.fromObject(value), existing);
+    const definition = NativeSourceSpec.fromObject(value);
+    if (definition.js && definition.js.trim()) {
+      const problem = NativeJsLibrary.check(definition.js, NativeExpr.libraryFunctionNames(definition.lib));
+      if (problem) throw new Error(problem);
+    }
+    return NativeSourceService.toBookSource(definition, existing);
   }
 
   /** 导出用：还原成带 sourceFormat 的定义对象。 */

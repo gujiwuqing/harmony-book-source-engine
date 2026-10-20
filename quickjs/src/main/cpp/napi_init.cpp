@@ -209,6 +209,129 @@ static napi_value CreateEngineWithOptions(napi_env env, napi_callback_info info)
     return result;
 }
 
+// ============== Synchronous host callback (same thread) ==============
+
+// Engines created on the ArkTS thread may expose `__host(name, payload)` that calls straight back into an
+// ArkTS function. Only valid while the engine is driven from that same thread (evaluateBounded etc.).
+struct MainHostEntry {
+    napi_env env = nullptr;
+    napi_ref callback = nullptr;
+};
+
+static std::mutex g_mainHostMutex;
+static std::unordered_map<JSContext*, MainHostEntry> g_mainHosts;
+
+static std::string NapiExceptionMessage(napi_env env, napi_value exception) {
+    if (!exception) return "host function failed";
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, exception, &type);
+    napi_value text = exception;
+    if (type == napi_object) {
+        napi_value message = nullptr;
+        if (napi_get_named_property(env, exception, "message", &message) == napi_ok) {
+            napi_valuetype messageType = napi_undefined;
+            napi_typeof(env, message, &messageType);
+            if (messageType == napi_string) text = message;
+        }
+    }
+    napi_value coerced = nullptr;
+    if (napi_coerce_to_string(env, text, &coerced) != napi_ok) return "host function failed";
+    std::string result = NValueToString(env, coerced);
+    return result.empty() ? "host function failed" : result;
+}
+
+static JSValue MainHostFunction(JSContext* ctx, JSValueConst thisValue, int argc, JSValueConst* argv) {
+    (void)thisValue;
+    MainHostEntry entry;
+    {
+        std::lock_guard<std::mutex> lock(g_mainHostMutex);
+        auto it = g_mainHosts.find(ctx);
+        if (it != g_mainHosts.end()) entry = it->second;
+    }
+    if (!entry.env || !entry.callback) return JS_ThrowInternalError(ctx, "host function is not available");
+
+    std::string name;
+    std::string payload;
+    if (argc > 0) {
+        const char* raw = JS_ToCString(ctx, argv[0]);
+        if (raw) { name = raw; JS_FreeCString(ctx, raw); }
+    }
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        size_t length = 0;
+        const char* raw = JS_ToCStringLen(ctx, &length, argv[1]);
+        if (raw) { payload.assign(raw, length); JS_FreeCString(ctx, raw); }
+    }
+
+    napi_env env = entry.env;
+    napi_handle_scope scope = nullptr;
+    napi_open_handle_scope(env, &scope);
+    napi_value callback = nullptr;
+    napi_get_reference_value(env, entry.callback, &callback);
+    napi_value undefinedValue = nullptr;
+    napi_get_undefined(env, &undefinedValue);
+    napi_value args[2] = {nullptr, nullptr};
+    napi_create_string_utf8(env, name.c_str(), name.size(), &args[0]);
+    napi_create_string_utf8(env, payload.c_str(), payload.size(), &args[1]);
+    napi_value result = nullptr;
+    const napi_status status = napi_call_function(env, undefinedValue, callback, 2, args, &result);
+
+    JSValue output;
+    bool pending = false;
+    napi_is_exception_pending(env, &pending);
+    if (status != napi_ok || pending) {
+        napi_value exception = nullptr;
+        napi_get_and_clear_last_exception(env, &exception);
+        const std::string message = NapiExceptionMessage(env, exception);
+        JSValue error = JS_NewError(ctx);
+        JS_SetPropertyStr(ctx, error, "message", JS_NewStringLen(ctx, message.data(), message.size()));
+        output = JS_Throw(ctx, error);
+    } else {
+        napi_value coerced = nullptr;
+        std::string text;
+        if (result && napi_coerce_to_string(env, result, &coerced) == napi_ok) text = NValueToString(env, coerced);
+        output = JS_NewStringLen(ctx, text.data(), text.size());
+    }
+    napi_close_handle_scope(env, scope);
+    return output;
+}
+
+static void ClearMainHost(napi_env env, JSContext* ctx) {
+    napi_ref callback = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mainHostMutex);
+        auto it = g_mainHosts.find(ctx);
+        if (it == g_mainHosts.end()) return;
+        callback = it->second.callback;
+        g_mainHosts.erase(it);
+    }
+    if (callback) napi_delete_reference(env, callback);
+}
+
+// engineSetHost(engineHandle, callback: (name, payload) => string): boolean
+static napi_value EngineSetHost(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    NAPI_CALL(napi_get_cb_info(env, info, &argc, args, nullptr, nullptr));
+    if (argc < 2) return NAPIBoolean(env, false);
+    JSContext* ctx = HandleToContext(NValueToHandle(env, args[0]));
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, args[1], &type);
+    if (!ctx || type != napi_function) return NAPIBoolean(env, false);
+
+    ClearMainHost(env, ctx);
+    MainHostEntry entry;
+    entry.env = env;
+    if (napi_create_reference(env, args[1], 1, &entry.callback) != napi_ok) return NAPIBoolean(env, false);
+    {
+        std::lock_guard<std::mutex> lock(g_mainHostMutex);
+        g_mainHosts[ctx] = entry;
+    }
+    JSValue global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "__host", JS_NewCFunction(ctx, MainHostFunction, "__host", 2));
+    JS_FreeValue(ctx, global);
+    return NAPIBoolean(env, true);
+}
+
 static napi_value ReleaseEngine(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1] = {nullptr};
@@ -217,6 +340,7 @@ static napi_value ReleaseEngine(napi_env env, napi_callback_info info) {
     int64_t engineHandle = NValueToHandle(env, args[0]);
     JSContext* ctx = HandleToContext(engineHandle);
     if (ctx) {
+        ClearMainHost(env, ctx);
         JSRuntime* rt = EngineRegistry::GetRuntime(engineHandle);
         EngineRegistry::Unregister(engineHandle);
         JS_FreeContext(ctx);
@@ -1131,6 +1255,7 @@ static napi_value Init(napi_env env, napi_value exports)
         // Script evaluation
         { "evaluateScript", nullptr, EvaluateScript, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "evaluateBounded", nullptr, EvaluateBounded, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "engineSetHost", nullptr, EngineSetHost, nullptr, nullptr, nullptr, napi_default, nullptr },
 
         // Error / Exception
         { "getException", nullptr, GetException, nullptr, nullptr, nullptr, napi_default, nullptr },

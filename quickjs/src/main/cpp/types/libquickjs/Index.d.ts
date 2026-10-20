@@ -81,6 +81,8 @@ export interface QuickJsNativeApi {
   evaluateScript(engineHandle: bigint, script: string, sourceURL?: string): bigint;
   evaluateBounded(engineHandle: bigint, script: string, sourceURL: string,
     timeoutMs: number, maxPendingJobs: number): BoundedExecutionResult;
+  /** Defines `__host(name, payload)` calling `callback` synchronously on the creating thread. */
+  engineSetHost(engineHandle: bigint, callback: (name: string, payload: string) => string): boolean;
 
   // Error / Exception
   getException(engineHandle: bigint): bigint;
