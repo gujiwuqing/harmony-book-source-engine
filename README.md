@@ -3,9 +3,10 @@
 HarmonyOS（ArkTS）书源解析内核，从[开源轻页（legado-harmony）](https://github.com/wip3l/legado-harmony)中拆出，供其他鸿蒙阅读类应用复用。
 
 - **兼容书源**：读取阅读（Legado）格式书源，支持 CSS / XPath / JSONPath / 正则规则、Java 正则方言转换、`@js:` 与 `<js>` 脚本、登录与网页验证。
-- **原生书源**：开源轻页自定的声明式书源格式，带一套只做纯计算的表达式语言，不执行 JavaScript。
+- **原生书源**：声明式规则、表达式与 `lib` 函数库；支持顶层 `js` JavaScript 函数库，以及搜索、发现、详情、目录、正文的后台 `script` 阶段。
 - **请求层**：HTTP 客户端、Cookie、TLS 例外、Basic / Digest 认证、书源限流与重试。
-- **脚本运行时**：受限 QuickJS，以及需要完整 JavaScript 语义时的分阶段 ArkWeb 运行层。
+- **脚本运行时**：原生书源使用 QuickJS 函数库与后台会话，受控接口提供请求、状态、登录和网页交互；兼容书源保留轻量解释器、分阶段 ArkWeb 与 QuickJS 影子/灰度迁移。
+- **原生书源设置**：支持脚本登录、发送验证码、动作按钮与动态变量选项；提示、刷新发现页和网页验证由宿主接入 `NativeSourceInteraction`。
 - **可选宿主端口**：Cookie、持久化、脚本执行器、请求调度、网页会话、错误状态与耗时诊断都可以由宿主替换。
 
 内核不包含界面，也不访问应用数据库。搜索、发现、详情/目录/正文的调度由宿主应用实现。目前开源轻页和简听都以本仓库为书源内核。
@@ -17,6 +18,8 @@ HarmonyOS（ArkTS）书源解析内核，从[开源轻页（legado-harmony）](h
 | [书源规则开发文档](docs/book-source-development.md) | 书源作者。原生书源与兼容书源的字段、表达式、选择器、示例与调试方法，在本仓库统一维护，轻页和简听的文档入口都指向这里；宿主界面与安全策略由各应用自己说明 |
 | [sourceengine/README.md](sourceengine/README.md) | 宿主开发者。HAR 的入口约束、必须接入的部分与可选宿主端口 |
 | [封面解密接入](docs/cover-decoding.md) | 宿主开发者。原生书源可声明 `coverDecode`，宿主用公共 `SourceCoverLoader` 按需加载，支持 AES-CBC 文件前缀 IV |
+
+原生 JS 有两条调用路径：表达式中按名调用 `js` 函数只做纯计算；阶段 `script: "函数名"` 在后台执行，可同步调用 `http`、`vars`、`cache` 等受控接口。它们不受兼容书源的 QuickJS 迁移模式控制。详见 [JS 函数库](docs/book-source-development.md#js-函数库-js)与[脚本阶段](docs/book-source-development.md#脚本阶段-script)。
 
 ## 仓库结构
 
@@ -75,6 +78,8 @@ DEVECO_HOME="/c/Program Files/Huawei/DevEco Studio" node scripts/web-book-fetch-
 | 脚本 | 检查内容 |
 | --- | --- |
 | `native-source-check` | 原生书源：表达式、各阶段字段、附加请求、目录分页、媒体错误原因 |
+| `native-js-check` | JS 函数库：表达式调用、`native` 内置函数、参数返回值、定义校验与错误 |
+| `native-script-check` | 后台脚本：阶段返回值、请求与状态、登录和界面交互、动态选项、预算与取消 |
 | `analyze-rule-check` | 兼容书源选择器与属性提取，结果与 `scripts/fixtures/analyze-rule-golden.json` 比对，并打印取字段耗时 |
 | `source-cover-check` | 封面解密参数校验、图片嗅探与解密 |
 | `page-candidate-url-check` | 搜索与发现地址的页码候选写法 |
