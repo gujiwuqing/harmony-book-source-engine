@@ -45,7 +45,7 @@ export class NativeJsLibrary implements NativeScriptLibrary {
    * 导入时的检查：能否载入，以及函数名是否与内置函数、lib 里的函数重名（重名时表达式不会调到 JS）。
    * 通过时返回空串。
    */
-  static check(code: string, libFunctionNames: string[]): string {
+  static check(code: string, libFunctionNames: string[], scriptFunctions: string[] = []): string {
     if (code.length > NativeJsPrelude.MAX_CODE_LENGTH) {
       return `js 太长：上限 ${Math.round(NativeJsPrelude.MAX_CODE_LENGTH / 1024)} KB`;
     }
@@ -63,7 +63,12 @@ export class NativeJsLibrary implements NativeScriptLibrary {
       const result = script.context.evaluateBounded(NativeJsPrelude.definedSource(names), 'js-check.js',
         NativeJsLibrary.CALL_TIMEOUT_MS, 0);
       if (!result.success) return `js：${NativeJsPrelude.shortError(result.error)}`;
-      return NativeJsPrelude.clashMessage(NativeJsPrelude.parseResult(result.value) as string[], builtins);
+      const clash = NativeJsPrelude.clashMessage(NativeJsPrelude.parseResult(result.value) as string[], builtins);
+      if (clash || scriptFunctions.length === 0) return clash;
+      const defined = script.context.evaluateBounded(NativeJsPrelude.definedSource(scriptFunctions), 'js-check.js',
+        NativeJsLibrary.CALL_TIMEOUT_MS, 0);
+      if (!defined.success) return `js：${NativeJsPrelude.shortError(defined.error)}`;
+      return NativeJsPrelude.missingMessage(scriptFunctions, NativeJsPrelude.parseResult(defined.value) as string[]);
     } finally {
       script.context.release();
     }

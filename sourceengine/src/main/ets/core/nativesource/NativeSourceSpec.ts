@@ -106,7 +106,16 @@ export interface NativeLoginSpec {
   check?: NativeLoginCheckSpec;
 }
 
+export interface NativeScriptLimitsSpec {
+  requests?: number;
+}
+
 export interface NativeStageSpec extends NativeRequestSpec {
+  /**
+   * js 里的函数名：由它代替请求取得这个阶段的“页面”，函数里可以同步发请求、读写变量。返回值之后照常
+   * 交给 list、fields 等规则；不写 list、fields 时按返回数组的每一项、同名键取值。
+   */
+  script?: string;
   let?: Record<string, NativeValue>;
   /** 求值结果非空时视为接口报错，文本即错误信息。 */
   fail?: string;
@@ -241,6 +250,8 @@ export interface NativeSourceDefinition {
   lib?: string;
   /** JS 函数库：顶层定义的函数可在表达式里按名调用，函数里通过 native.名称 使用内置函数。只做纯计算。 */
   js?: string;
+  /** 脚本阶段的预算：每次阶段运行最多发多少个请求（默认 30，上限 100）。 */
+  scriptLimits?: NativeScriptLimitsSpec;
   login?: NativeLoginSpec;
   /** 可选的听书音色。用户在听书页选中的 id 存在书籍变量里，规则通过 book.vars.custom 读取。 */
   voices?: NativeVoiceSpec[];
@@ -259,6 +270,19 @@ export class NativeSourceSpec {
   static readonly FORMAT: string = 'native';
   static readonly VERSION: number = 1;
   static readonly SEARCH_MARKER: string = 'native:search';
+  /** 可以写 script 的阶段。 */
+  static readonly SCRIPT_STAGES: string[] = ['search', 'explore', 'detail', 'toc', 'content'];
+
+  /** 定义里各阶段 script 指向的函数名。 */
+  static scriptFunctions(definition: NativeSourceDefinition): string[] {
+    const names: string[] = [];
+    for (const name of NativeSourceSpec.SCRIPT_STAGES) {
+      const stage = (definition as NativeValue as Record<string, NativeValue>)[name] as NativeStageSpec | undefined;
+      const fn = stage && typeof stage.script === 'string' ? stage.script.trim() : '';
+      if (fn && names.indexOf(fn) < 0) names.push(fn);
+    }
+    return names;
+  }
   static readonly EXPLORE_MARKER: string = 'native:explore';
 
   private static unpackCache: Map<string, NativeSourceDefinition> = new Map();
@@ -398,6 +422,23 @@ export class NativeSourceSpec {
     } else if (definition.js && definition.js.length > NativeJsPrelude.MAX_CODE_LENGTH) {
       errors.push(`js 太长：上限 ${Math.round(NativeJsPrelude.MAX_CODE_LENGTH / 1024)} KB`);
     }
+    for (const name of NativeSourceSpec.SCRIPT_STAGES) {
+      const stage = (definition as NativeValue as Record<string, NativeValue>)[name] as NativeStageSpec | undefined;
+      if (!stage || stage.script === undefined) continue;
+      if (typeof stage.script !== 'string' || !NativeJsPrelude.isIdentifier(stage.script.trim())) {
+        errors.push(`${name}.script 必须是 js 里的函数名`);
+      } else if (!definition.js || !definition.js.trim()) {
+        errors.push(`${name}.script 需要在 js 里定义函数 ${stage.script.trim()}`);
+      }
+    }
+    if (definition.scriptLimits !== undefined) {
+      const limits = definition.scriptLimits;
+      const requests = limits && typeof limits === 'object' ? limits.requests : undefined;
+      if (!limits || typeof limits !== 'object' || (requests !== undefined &&
+        !(Number.isInteger(requests) && requests >= 1 && requests <= 100))) {
+        errors.push('scriptLimits.requests 必须是 1 到 100 的整数');
+      }
+    }
     if (definition.voices !== undefined) {
       if (!Array.isArray(definition.voices)) {
         errors.push('voices 必须是数组');
@@ -475,7 +516,7 @@ export class NativeSourceSpec {
       NativeSourceSpec.checkValues(entry[1], entry[0], errors);
     }
     if (definition.search) {
-      if (!definition.search.url) errors.push('search 缺少 url');
+      if (!definition.search.url && !definition.search.script) errors.push('search 缺少 url');
       NativeSourceSpec.requireBookFields(definition.search, 'search', errors);
     }
     if (definition.explore) {
@@ -491,15 +532,19 @@ export class NativeSourceSpec {
       NativeSourceSpec.requireBookFields(explore, 'explore', errors);
     }
     if (definition.toc) {
+      // 脚本阶段可以不写 list 和 fields（按返回数组的每项、同名键取值）；写了 fields 就要写全。
+      const scripted = !!definition.toc.script;
       const fields = definition.toc.fields || {};
-      if (!definition.toc.list) errors.push('toc 缺少 list');
-      if (!fields['title']) errors.push('toc.fields 缺少 title');
-      if (!fields['url']) errors.push('toc.fields 缺少 url');
+      if (!definition.toc.list && !scripted) errors.push('toc 缺少 list');
+      if (!scripted || definition.toc.fields) {
+        if (!fields['title']) errors.push('toc.fields 缺少 title');
+        if (!fields['url']) errors.push('toc.fields 缺少 url');
+      }
       NativeSourceSpec.checkBatch(definition.toc.batch, 'toc.batch', errors);
     }
     if (definition.content) {
       const content = definition.content;
-      if (!content.text && !content.images && !content.audio && !content.video) {
+      if (!content.text && !content.images && !content.audio && !content.video && !content.script) {
         errors.push('content 需要 text、images、audio 或 video 之一');
       }
       if (content.replace !== undefined && !Array.isArray(content.replace)) errors.push('content.replace 必须是数组');
@@ -547,7 +592,8 @@ export class NativeSourceSpec {
 
   private static requireBookFields(stage: NativeStageSpec, name: string, errors: string[]): void {
     const fields = stage.fields || {};
-    if (!stage.list) errors.push(`${name} 缺少 list`);
+    if (!stage.list && !stage.script) errors.push(`${name} 缺少 list`);
+    if (stage.script && !stage.fields) return;
     if (!fields['name']) errors.push(`${name}.fields 缺少 name`);
     if (!fields['bookUrl']) errors.push(`${name}.fields 缺少 bookUrl`);
   }

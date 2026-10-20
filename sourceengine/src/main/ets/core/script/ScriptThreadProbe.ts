@@ -7,6 +7,11 @@ import { NativeExpr, NativeScope } from '../nativesource/NativeExpr';
 import type { NativeExprHost, NativeValue } from '../nativesource/NativeExpr';
 import { NativeJsLibrary } from '../nativesource/NativeJsLibrary';
 import { NativeSourceCrypto } from '../nativesource/NativeSourceCrypto';
+import { NativeSourceRunner } from '../nativesource/NativeSourceRunner';
+import type { NativeBookRecord, NativeRequest, NativeResponse, NativeRunnerHost } from '../nativesource/NativeSourceRunner';
+import { NativeSourceSpec } from '../nativesource/NativeSourceSpec';
+import { NativeScriptSessions } from '../nativesource/NativeScriptSessions';
+import type { NativeScriptEngine } from '../nativesource/NativeScriptHost';
 
 /** JS 函数库验证用的表达式宿主：与原生书源运行时相同的选择器、摘要和加解密实现。 */
 class ProbeExprHost implements NativeExprHost {
@@ -27,6 +32,65 @@ class ProbeExprHost implements NativeExprHost {
 
   crypto(name: string, args: NativeValue[]): NativeValue {
     return NativeSourceCrypto.run(name, args as Object[]);
+  }
+}
+
+/** 脚本阶段验证用的运行器宿主：真实请求、真机脚本会话池，变量和 Cookie 只存在内存里。 */
+class ProbeRunnerHost extends ProbeExprHost implements NativeRunnerHost {
+  http: HttpClient = new HttpClient(15000);
+  requests: number = 0;
+  savedVars: Record<string, NativeValue> = {};
+  private cookies: Map<string, string> = new Map();
+  private cache: Map<string, NativeValue> = new Map();
+
+  cacheGet(key: string): NativeValue {
+    return this.cache.get(key);
+  }
+
+  cachePut(key: string, value: NativeValue, ttlSeconds: number): void {
+    this.cache.set(key, value);
+  }
+
+  async fetch(request: NativeRequest): Promise<NativeResponse> {
+    this.requests++;
+    const response = await this.http.execute({
+      url: request.url, method: request.method, headers: request.headers, body: request.body || undefined
+    });
+    return {
+      ok: response.success, status: response.statusCode, body: response.body, url: response.url || request.url,
+      error: response.error || ''
+    };
+  }
+
+  selectItems(content: string, rule: string, baseUrl: string): NativeValue[] {
+    return new AnalyzeRule(content, baseUrl).getStringList(rule);
+  }
+
+  scriptEngine(code: string): NativeScriptEngine {
+    return NativeScriptSessions.forCode(code);
+  }
+
+  cookieGet(url: string, name: string): string {
+    return this.cookies.get(`${url}\n${name}`) || '';
+  }
+
+  cookieSet(url: string, value: string): void {
+    for (const part of value.split(';')) {
+      const index = part.indexOf('=');
+      if (index > 0) this.cookies.set(`${url}\n${part.substring(0, index).trim()}`, part.substring(index + 1).trim());
+    }
+  }
+
+  cookieRemove(url: string, name: string): void {
+    this.cookies.delete(`${url}\n${name}`);
+  }
+
+  async saveVars(values: Record<string, NativeValue>): Promise<void> {
+    this.savedVars = values;
+  }
+
+  deviceId(): string {
+    return 'probe';
   }
 }
 
@@ -70,6 +134,9 @@ export class ScriptThreadProbe {
       ['JS 函数库：超时与报错', () => ScriptThreadProbe.jsLibraryErrors()],
       ['JS 函数库：导入检查', () => ScriptThreadProbe.jsLibraryCheck()],
       ['JS 函数库：大代码载入与缓存淘汰', () => ScriptThreadProbe.jsLibraryLoad()],
+      ['脚本阶段：循环与并发的真实请求', () => ScriptThreadProbe.scriptStage(httpUrl)],
+      ['脚本阶段：会话复用与状态接口', () => ScriptThreadProbe.scriptStageState()],
+      ['脚本阶段：请求预算与取消', () => ScriptThreadProbe.scriptStageLimits()],
     ];
     for (const entry of cases) {
       let result: ScriptProbeResult;
@@ -377,6 +444,92 @@ export class ScriptThreadProbe {
     return ScriptThreadProbe.result(ok,
       `重名：${clash}；与 lib 重名：${libClash}；语法错误：${ScriptThreadProbe.firstLine(syntax)}；` +
         `顶层调用 native：${ScriptThreadProbe.firstLine(topLevel)}；正常代码：${good || '通过'}`);
+  }
+
+  /** 一个只有搜索阶段的原生书源，搜索交给 js 里的 search。代码带时间戳，每次验证都重新载入。 */
+  private static scriptSource(js: string, extra: Record<string, NativeValue> = {}): NativeSourceRunner {
+    return ScriptThreadProbe.scriptRunner(js, extra, new ProbeRunnerHost());
+  }
+
+  private static scriptRunner(js: string, extra: Record<string, NativeValue>, host: ProbeRunnerHost): NativeSourceRunner {
+    const definition: Record<string, NativeValue> = {
+      sourceFormat: 'native', version: 1, name: '脚本验证', url: 'https://www.baidu.com',
+      js: `// probe ${Date.now()}\n${js}`, search: { script: 'search' }
+    };
+    for (const key of Object.keys(extra)) definition[key] = extra[key];
+    return new NativeSourceRunner(NativeSourceSpec.fromObject(definition), host, {});
+  }
+
+  private static async scriptStage(url: string): Promise<ScriptProbeResult> {
+    const host = new ProbeRunnerHost();
+    const runner = ScriptThreadProbe.scriptRunner(`function search(ctx) {
+  const target = ${JSON.stringify(url)};
+  const first = http.get(target);
+  const all = http.all([target, target, target]);
+  let sizes = [first.status + '/' + first.body.length];
+  for (const r of all) sizes.push(r.status + '/' + r.body.length);
+  return [{ name: sizes.join(' '), bookUrl: '/probe', kind: native.md5(ctx.key).slice(0, 6) }];
+}`, {}, host);
+    const startedAt = Date.now();
+    const books: NativeBookRecord[] = await runner.search('斗破', 1);
+    const ms = Date.now() - startedAt;
+    const ok = books.length === 1 && /^200\/\d+ 200\/\d+ 200\/\d+ 200\/\d+$/.test(books[0].name) && host.requests === 4 &&
+      books[0].kind === new NativeExpr(new ProbeExprHost()).evaluate("substring(md5('斗破'), 0, 6)", new NativeScope());
+    return ScriptThreadProbe.result(ok,
+      `1 次请求加 3 次并发请求：${books.length > 0 ? books[0].name : '无结果'}；地址 ${books.length > 0 ? books[0].bookUrl : ''}；共 ${ms} ms`);
+  }
+
+  private static async scriptStageState(): Promise<ScriptProbeResult> {
+    const host = new ProbeRunnerHost();
+    const js = `var runs = (typeof runs === 'number' ? runs : 0);
+function search(ctx) {
+  runs += 1;
+  vars.set('mode', 'b');
+  temp.set('t', 1);
+  cache.put('c', 'v', 60);
+  cookie.set('https://www.baidu.com/', 'sid=9');
+  return [{ name: [runs, vars.get('mode'), temp.get('t'), cache.get('c'), cookie.get('https://www.baidu.com/', 'sid'),
+    device.id].join('|'), bookUrl: '/x' }];
+}`;
+    const runner = ScriptThreadProbe.scriptRunner(js, {}, host);
+    let startedAt = Date.now();
+    const first: NativeBookRecord[] = await runner.search('a', 1);
+    const firstMs = Date.now() - startedAt;
+    startedAt = Date.now();
+    const second: NativeBookRecord[] = await runner.search('a', 1);
+    const secondMs = Date.now() - startedAt;
+    const a = first.length > 0 ? first[0].name : '';
+    const b = second.length > 0 ? second[0].name : '';
+    const ok = a === '1|b|1|v|9|probe' && b === '2|b|1|v|9|probe' && host.savedVars['mode'] === 'b';
+    return ScriptThreadProbe.result(ok, `第一次 ${a}（${firstMs} ms，含载入），第二次 ${b}（${secondMs} ms，复用会话）`);
+  }
+
+  private static async scriptStageLimits(): Promise<ScriptProbeResult> {
+    const failure = async (runner: NativeSourceRunner): Promise<string> => {
+      try {
+        await runner.search('a', 1);
+        return '';
+      } catch (e) {
+        return (e as Error).message;
+      }
+    };
+    const budget = await failure(ScriptThreadProbe.scriptSource(
+      "function search() { for (let i = 0; i < 5; i++) http.get('data:text/plain,' + i); return []; }",
+      { scriptLimits: { requests: 3 } }));
+    const spin = await failure(ScriptThreadProbe.scriptSource('function search() { for (;;) {} }'));
+    let stop = false;
+    const looping = ScriptThreadProbe.scriptSource("function search() { for (;;) http.get('https://www.baidu.com/'); }")
+      .setCancelCheck((): boolean => stop);
+    const startedAt = Date.now();
+    setTimeout((): void => {
+      stop = true;
+    }, 800);
+    const cancelled = await failure(looping);
+    const cancelMs = Date.now() - startedAt;
+    const ok = /请求次数超过上限（3 次）/.test(budget) && /计算时间超过 2 秒/.test(spin) && /已取消/.test(cancelled) &&
+      cancelMs < 2500;
+    return ScriptThreadProbe.result(ok, `预算：${ScriptThreadProbe.firstLine(budget)}；死循环：${spin}；` +
+      `取消：${cancelled}（${cancelMs} ms）`);
   }
 
   private static async jsLibraryLoad(): Promise<ScriptProbeResult> {

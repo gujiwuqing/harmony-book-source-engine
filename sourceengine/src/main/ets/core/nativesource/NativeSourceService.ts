@@ -35,6 +35,10 @@ import type {
 import type { NativeLoginFieldSpec } from './NativeSourceSpec';
 import { NetworkErrorText } from '../http/NetworkErrorText';
 import { NativeSourceImport } from './NativeSourceImport';
+import { NativeScriptSessions } from './NativeScriptSessions';
+import type { NativeScriptEngine } from './NativeScriptHost';
+import { BookSourceRuntimeStore } from '../book/BookSourceRuntimeStore';
+import { deviceInfo } from '@kit.BasicServicesKit';
 
 export interface NativeFilterGroup {
   title: string;
@@ -166,6 +170,54 @@ class NativeHost implements NativeRunnerHost {
     return NativeJsLibrary.forCode(code);
   }
 
+  scriptEngine(code: string): NativeScriptEngine {
+    return NativeScriptSessions.forCode(code);
+  }
+
+  cookieGet(url: string, name: string): string {
+    const jar = CookieStore.forSource(this.source.bookSourceUrl);
+    return name ? jar.getCookieValue(url, name) : jar.getCookie(url);
+  }
+
+  cookieSet(url: string, value: string): void {
+    const jar = CookieStore.forSource(this.source.bookSourceUrl);
+    jar.setCookies(url, value);
+    jar.saveAsync();
+  }
+
+  cookieRemove(url: string, name: string): void {
+    const jar = CookieStore.forSource(this.source.bookSourceUrl);
+    jar.removeCookie(url, name || undefined);
+    jar.saveAsync();
+  }
+
+  async saveVars(values: Record<string, NativeValue>): Promise<void> {
+    await NativeSourceService.saveRuntime(this.source, JSON.stringify(values), null);
+  }
+
+  async saveCredential(token: string, user: string): Promise<void> {
+    await NativeSourceService.saveRuntime(this.source, null, NativeSourceService.loginInfoWith(this.source, token, user));
+  }
+
+  deviceId(): string {
+    try {
+      return deviceInfo.ODID || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  userAgent(): string {
+    try {
+      const headers = JSON.parse(this.source.header || '{}') as Record<string, Object>;
+      for (const name of Object.keys(headers)) {
+        if (name.toLowerCase() === 'user-agent' && headers[name]) return String(headers[name]);
+      }
+    } catch (e) {
+    }
+    return HttpClient.DEFAULT_USER_AGENT;
+  }
+
   selectItems(content: string, rule: string, baseUrl: string): NativeValue[] {
     const values = new AnalyzeRule(content, baseUrl).execute(rule, RuleExecutionTarget.ELEMENTS);
     return values.map((value: RuleValue): NativeValue => {
@@ -217,6 +269,11 @@ class NativeHost implements NativeRunnerHost {
   cookie(url: string, name: string): string {
     return CookieStore.forSource(this.source.bookSourceUrl).getCookieValue(url, name);
   }
+}
+
+interface NativeRuntimeState {
+  variable: string | null;
+  loginInfo: string | null;
 }
 
 interface NativeCacheEntry {
@@ -276,7 +333,8 @@ export class NativeSourceService {
   static importObject(value: Object, existing: BookSource | null = null): BookSource {
     const definition = NativeSourceSpec.fromObject(value);
     if (definition.js && definition.js.trim()) {
-      const problem = NativeJsLibrary.check(definition.js, NativeExpr.libraryFunctionNames(definition.lib));
+      const problem = NativeJsLibrary.check(definition.js, NativeExpr.libraryFunctionNames(definition.lib),
+        NativeSourceSpec.scriptFunctions(definition));
       if (problem) throw new Error(problem);
     }
     return NativeSourceService.toBookSource(definition, existing);
@@ -287,9 +345,45 @@ export class NativeSourceService {
     return NativeSourceSpec.toExportObject(NativeSourceService.definitionOf(source)) as Object;
   }
 
+  /**
+   * 脚本写入的变量和登录凭据：已经保存到数据库，但别处拿着的书源对象可能还是旧值。在设置页下次保存前，
+   * 以这里记下的为准，避免下一次运行读到旧值、把脚本刚写的值覆盖掉。
+   */
+  private static runtimeState: Map<string, NativeRuntimeState> = new Map();
+
+  /** 保存脚本写入的变量（variable）或登录凭据（loginInfo），传 null 的那一项不变。 */
+  static async saveRuntime(source: BookSource, variable: string | null, loginInfo: string | null): Promise<void> {
+    const url = source.bookSourceUrl;
+    const state = NativeSourceService.runtimeState.get(url) || { variable: null, loginInfo: null };
+    if (variable !== null) {
+      state.variable = variable;
+      source.variable = variable;
+    }
+    if (loginInfo !== null) {
+      state.loginInfo = loginInfo;
+      source.loginInfo = loginInfo;
+    }
+    NativeSourceService.runtimeState.set(url, state);
+    const persistence = BookSourceRuntimeStore.forSource(source);
+    if (persistence) {
+      await persistence.updateBookSourceLoginRuntime(url, NativeSourceService.effectiveVariable(source),
+        source.loginHeader || '', NativeSourceService.effectiveLoginInfo(source));
+    }
+  }
+
+  private static effectiveVariable(source: BookSource): string {
+    const state = NativeSourceService.runtimeState.get(source.bookSourceUrl);
+    return state && state.variable !== null ? state.variable : (source.variable || '');
+  }
+
+  private static effectiveLoginInfo(source: BookSource): string {
+    const state = NativeSourceService.runtimeState.get(source.bookSourceUrl);
+    return state && state.loginInfo !== null ? state.loginInfo : (source.loginInfo || '');
+  }
+
   static storedVars(source: BookSource): Record<string, NativeValue> {
     try {
-      const parsed = JSON.parse(source.variable || '{}') as Object;
+      const parsed = JSON.parse(NativeSourceService.effectiveVariable(source) || '{}') as Object;
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, NativeValue>;
     } catch (e) {
     }
@@ -313,6 +407,9 @@ export class NativeSourceService {
   static variableWithValues(source: BookSource, items: NativeVarItem[]): string {
     const stored = NativeSourceService.storedVars(source);
     for (const item of items) stored[item.key] = item.value;
+    // 设置页接着会保存这个结果，之后以书源对象上的值为准。
+    const state = NativeSourceService.runtimeState.get(source.bookSourceUrl);
+    if (state) state.variable = null;
     return JSON.stringify(stored);
   }
 
@@ -404,7 +501,7 @@ export class NativeSourceService {
 
   static credential(source: BookSource): NativeLoginCredential {
     try {
-      const parsed = JSON.parse(source.loginInfo || '{}') as Record<string, Object>;
+      const parsed = JSON.parse(NativeSourceService.effectiveLoginInfo(source) || '{}') as Record<string, Object>;
       return { token: String(parsed['nativeToken'] || ''), user: String(parsed['nativeUser'] || '') };
     } catch (e) {
       return { token: '', user: '' };
@@ -414,8 +511,12 @@ export class NativeSourceService {
   /** 写入或清除凭据后的 loginInfo 文本。只保存登录换来的凭据，不保存用户填写的密码。 */
   static loginInfoWith(source: BookSource, token: string, user: string): string {
     let record: Record<string, Object> = {};
+    const loginInfo = NativeSourceService.effectiveLoginInfo(source);
+    // 调用方接着会保存这个结果，之后以书源对象上的值为准。
+    const state = NativeSourceService.runtimeState.get(source.bookSourceUrl);
+    if (state) state.loginInfo = null;
     try {
-      const parsed = JSON.parse(source.loginInfo || '{}') as Object;
+      const parsed = JSON.parse(loginInfo || '{}') as Object;
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) record = parsed as Record<string, Object>;
     } catch (e) {
     }

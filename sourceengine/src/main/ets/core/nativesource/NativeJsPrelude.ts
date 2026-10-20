@@ -14,10 +14,27 @@ export class NativeJsPrelude {
   /**
    * 在书源代码之前执行：用 __host 搭出只读的 native 对象，之后删掉 __host，书源代码只能经 native 调内置函数。
    * 内置函数的参数和返回值都按 JSON 传递。
+   *
+   * script 为 true 时是脚本阶段的后台环境，另外提供 http、vars、temp、cache、cookie、login、keep、log、sleep、
+   * page、device；为 false 时是表达式里调用的环境，这些名字存在但一用就报错，提示改用阶段的 script。
    */
-  static source(builtins: string[]): string {
+  static source(builtins: string[], script: boolean = false): string {
     return `(function (g) {
   var host = g.__host;
+  var define = function (name, value) {
+    Object.defineProperty(g, name, { value: value, writable: true, configurable: true, enumerable: false });
+  };
+  var call = function (name, args) {
+    var out = host(name, JSON.stringify(args));
+    return out === '' ? null : JSON.parse(out);
+  };
+  define('uuid', function () {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+      var r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 3 | 8)).toString(16);
+    });
+  });
+${script ? NativeJsPrelude.SCRIPT_API : NativeJsPrelude.EXPRESSION_STUBS}
   var names = ${JSON.stringify(builtins)};
   var api = {};
   names.forEach(function (name) {
@@ -43,6 +60,102 @@ export class NativeJsPrelude {
   });
   delete g.__host;
 })(globalThis);`;
+  }
+
+  /** 脚本阶段的宿主接口：每个调用都经 __host 同步交给宿主，名字以 @ 开头，与内置函数区分。 */
+  private static readonly SCRIPT_API: string = `
+  var wrap = function (response) {
+    if (response && typeof response === 'object') {
+      Object.defineProperty(response, 'json', {
+        value: function () { return JSON.parse(response.body); }, enumerable: false
+      });
+    }
+    return response;
+  };
+  var toRequest = function (input, method, body, options) {
+    var request = typeof input === 'string' ? { url: input } : Object.assign({}, input || {});
+    if (options) Object.assign(request, options);
+    if (method && !request.method) request.method = method;
+    if (body !== undefined) request.body = body;
+    if (request.body !== undefined && request.body !== null && typeof request.body !== 'string') {
+      request.headers = Object.assign({}, request.headers || {});
+      var typed = Object.keys(request.headers).some(function (name) { return name.toLowerCase() === 'content-type'; });
+      if (!typed) request.headers['Content-Type'] = 'application/json';
+      request.body = JSON.stringify(request.body);
+    }
+    return request;
+  };
+  define('http', Object.freeze({
+    get: function (url, options) { return wrap(call('@http', [toRequest(url, 'GET', undefined, options)])); },
+    post: function (url, body, options) { return wrap(call('@http', [toRequest(url, 'POST', body, options)])); },
+    request: function (request) { return wrap(call('@http', [toRequest(request)])); },
+    all: function (list) {
+      return call('@httpAll', [(list || []).map(function (item) { return toRequest(item); })]).map(wrap);
+    }
+  }));
+  var store = function (prefix) {
+    return Object.freeze({
+      get: function (key) { return call('@' + prefix + 'Get', [String(key)]); },
+      set: function (key, value, ttl) { call('@' + prefix + 'Set', [String(key), value === undefined ? null : value, ttl]); }
+    });
+  };
+  define('vars', store('vars'));
+  define('temp', store('temp'));
+  var cacheStore = store('cache');
+  define('cache', Object.freeze({ get: cacheStore.get, set: cacheStore.set, put: cacheStore.set }));
+  define('cookie', Object.freeze({
+    get: function (url, name) { return call('@cookieGet', [String(url), name === undefined ? '' : String(name)]); },
+    set: function (url, value) { call('@cookieSet', [String(url), String(value)]); },
+    remove: function (url, name) { call('@cookieRemove', [String(url), name === undefined ? '' : String(name)]); }
+  }));
+  define('login', Object.freeze({
+    get token() { return call('@login', []).token; },
+    get user() { return call('@login', []).user; },
+    save: function (token, user) {
+      call('@loginSave', [token === undefined || token === null ? '' : String(token),
+        user === undefined || user === null ? '' : String(user)]);
+    }
+  }));
+  define('device', Object.freeze({
+    get id() { return call('@device', ['id']); },
+    get ua() { return call('@device', ['ua']); }
+  }));
+  define('keep', function (key, value) {
+    call('@keep', [String(key), value === undefined || value === null ? '' : String(value)]);
+  });
+  define('log', function () {
+    call('@log', [Array.prototype.map.call(arguments, function (part) {
+      return typeof part === 'string' ? part : JSON.stringify(part);
+    }).join(' ')]);
+  });
+  define('sleep', function (ms) { call('@sleep', [Number(ms) || 0]); });
+  define('page', function (body, url) {
+    return { __nativePage: true, body: body === undefined || body === null ? '' : String(body),
+      url: url === undefined || url === null ? '' : String(url) };
+  });`;
+
+  /** 表达式环境里的同名占位：规则在主线程同步求值，不能等网络，也不应改动状态。 */
+  private static readonly EXPRESSION_STUBS: string = `
+  var refuse = function () { throw new Error('表达式里不能发请求或读写状态，请改用阶段的 script'); };
+  ['http', 'vars', 'temp', 'cache', 'cookie', 'login', 'device'].forEach(function (name) {
+    define(name, new Proxy({}, {
+      get: function (target, key) {
+        if (typeof key !== 'string' || key === 'toJSON' || key === 'then') return undefined;
+        return refuse();
+      }
+    }));
+  });
+  ['keep', 'log', 'sleep', 'page'].forEach(function (name) { define(name, refuse); });`;
+
+  /** 脚本阶段返回 page(body, url) 时的标记。 */
+  static isPage(value: NativeValue): boolean {
+    return !!value && typeof value === 'object' && !Array.isArray(value) && value['__nativePage'] === true;
+  }
+
+  /** 调用脚本阶段的函数：fn(ctx)，结果是 JSON 文本；async 函数在本次运行里求出结果。 */
+  static stageSource(fn: string, ctx: NativeValue): string {
+    return `(function () { var r = ${fn}(${JSON.stringify(ctx === undefined ? null : ctx)});\n` +
+      `return r && typeof r.then === 'function' ? r.then(__nativeReturn) : __nativeReturn(r); })()`;
   }
 
   /** JS 保留字不能用作函数名；内置函数里有 default，拼进检查代码会成为语法错误。 */
@@ -81,6 +194,12 @@ export class NativeJsPrelude {
     const name = clashes[0];
     return builtins.indexOf(name) >= 0 ? `js 里的函数 “${name}” 与内置函数重名` :
       `js 里的函数 “${name}” 与 lib 里的函数重名`;
+  }
+
+  /** 阶段 script 指向的函数没有在 js 里定义时的错误信息；都在时返回空串。 */
+  static missingMessage(required: string[], defined: string[]): string {
+    const missing = required.filter((name: string): boolean => defined.indexOf(name) < 0);
+    return missing.length > 0 ? `js 里没有阶段 script 用到的函数 “${missing[0]}”` : '';
   }
 
   static parseResult(text: string): NativeValue {

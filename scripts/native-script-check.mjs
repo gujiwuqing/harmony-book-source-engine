@@ -1,0 +1,285 @@
+// 原生书源脚本阶段回归：阶段 script、宿主接口（http/vars/temp/cache/cookie/login/keep/log/device/sleep）、
+// 预算、取消、出错提示与定义校验。脚本在 worker 线程里同步调用宿主，与真机的线程模型一致。
+// 运行：node --experimental-strip-types scripts/native-script-check.mjs
+
+import vm from 'node:vm';
+import { createTestHost, loadNativeSourceModules } from './lib/load-native-source-modules.mjs';
+import { createNodeScriptEngine } from './lib/node-script-engine.mjs';
+
+const mods = await loadNativeSourceModules();
+const { NativeExpr, NativeScope, NativeSourceSpec, NativeSourceRunner, NativeJsPrelude, JsonPathEvaluator } = mods;
+
+let assertions = 0;
+function equal(actual, expected, message) {
+  assertions++;
+  const a = JSON.stringify(actual);
+  const b = JSON.stringify(expected);
+  if (a !== b) throw new Error(`${message}\n  expected: ${b}\n  actual:   ${a}`);
+}
+async function rejects(promise, pattern, message) {
+  assertions++;
+  let text = '';
+  try {
+    await promise;
+  } catch (e) {
+    text = e.message;
+  }
+  if (!pattern.test(text)) throw new Error(`${message}：应当报错，实际：${text || '未报错'}`);
+}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** 测试宿主：在 createTestHost 之上补齐脚本阶段需要的端口，并记下写入。 */
+function scriptHost(respond) {
+  const host = createTestHost(JsonPathEvaluator, respond);
+  const cookies = new Map();
+  host.saved = { vars: null, credential: null };
+  host.scriptEngine = (code) => createNodeScriptEngine(NativeJsPrelude, NativeExpr.scriptBuiltinNames(), code);
+  host.cookieGet = (url, name) => {
+    const jar = cookies.get(new URL(url).host) || {};
+    return name ? (jar[name] || '') : Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+  };
+  host.cookieSet = (url, value) => {
+    const key = new URL(url).host;
+    const jar = cookies.get(key) || {};
+    for (const part of value.split(';')) {
+      const [name, ...rest] = part.trim().split('=');
+      if (name) jar[name] = rest.join('=');
+    }
+    cookies.set(key, jar);
+  };
+  host.cookieRemove = (url, name) => {
+    const key = new URL(url).host;
+    if (!name) cookies.delete(key);
+    else if (cookies.get(key)) delete cookies.get(key)[name];
+  };
+  host.saveVars = async (values) => { host.saved.vars = values; };
+  host.saveCredential = async (token, user) => { host.saved.credential = { token, user }; };
+  host.deviceId = () => 'odid-test';
+  host.userAgent = () => 'UA-test';
+  return host;
+}
+
+const define = (object) => NativeSourceSpec.fromObject(JSON.parse(JSON.stringify(object)));
+const base = {
+  sourceFormat: 'native', version: 1, name: '脚本示例', url: 'https://api.example.com',
+  search: { url: '/s', list: '$.l', fields: { name: '$.n', bookUrl: '$.u' } },
+};
+const book = { bookUrl: 'https://api.example.com/b/1', tocUrl: '', name: '书', author: '', kind: '', type: 'text', vars: {} };
+const chapter = { url: 'https://api.example.com/c/1', title: '第一章', index: 0 };
+
+const library = {
+  '/ids': { ids: [1, 2, 3] },
+  '/book?id=1': { id: 1, title: '斗破', author: '土豆' },
+  '/book?id=2': { id: 2, title: '凡人', author: '忘语' },
+  '/book?id=3': { id: 3, title: '诡秘', author: '乌贼' },
+};
+const respond = async (request) => {
+  const path = request.url.replace(/^https?:\/\/[^/]+/, '');
+  if (path.startsWith('/slow')) {
+    await sleep(40);
+    return { ok: 1 };
+  }
+  if (path.startsWith('/echo')) return { method: request.method, body: request.body, headers: request.headers };
+  for (const prefix of Object.keys(library)) if (path.startsWith(prefix)) return library[prefix];
+  return null;
+};
+
+try {
+  // ---------- 搜索：循环请求、并发请求、默认 list 与 fields ----------
+  const searchSource = define({
+    ...base,
+    js: `
+      function search(ctx) {
+        const ids = http.get('/ids?q=' + encodeURIComponent(ctx.key)).json().ids;
+        const pages = http.all(ids.map((id) => '/book?id=' + id));
+        log('找到', ids.length, '本');
+        return pages.map((p) => { const b = p.json(); return { name: b.title, author: b.author, bookUrl: '/b/' + b.id }; });
+      }`,
+    search: { script: 'search' },
+  });
+  let host = scriptHost(respond);
+  const books = await new NativeSourceRunner(searchSource, host, {}).search('斗破', 1);
+  equal(books.map((b) => [b.name, b.author, b.bookUrl]), [
+    ['斗破', '土豆', 'https://api.example.com/b/1'],
+    ['凡人', '忘语', 'https://api.example.com/b/2'],
+    ['诡秘', '乌贼', 'https://api.example.com/b/3'],
+  ], '脚本循环与并发请求，返回数组按同名键取字段');
+  equal(host.requests.map((r) => r.url), ['https://api.example.com/ids?q=%E6%96%97%E7%A0%B4',
+    'https://api.example.com/book?id=1', 'https://api.example.com/book?id=2', 'https://api.example.com/book?id=3'],
+  '相对地址按书源地址补全，请求走宿主 fetch');
+  equal(host.requests.every((r) => r.primary === false), true, '脚本里的请求不触发“去验证”');
+  equal(host.traces.some((t) => t.type === 'script' && t.rule === 'log' && t.preview === '找到 3 本'), true, 'log 写进调试记录');
+  equal(host.traces.some((t) => t.type === 'script' && t.rule === 'return' && /3 项，请求 4 次/.test(t.preview)), true,
+    '返回值摘要与请求次数');
+
+  // ---------- page()、显式 list 与 fields、POST 与 JSON 请求体、async 函数 ----------
+  const pageSource = define({
+    ...base,
+    js: `
+      async function search(ctx) {
+        const echoed = http.post('/echo', { key: ctx.key }).json();
+        return page(JSON.stringify({ list: [{ t: echoed.body, u: 'x/1' }], method: echoed.method,
+          type: echoed.headers['Content-Type'] }), '/sub/');
+      }`,
+    search: { script: 'search', list: '$.list', fields: { name: '$.t', bookUrl: '$.u', kind: '= data.method + " " + data.type' } },
+  });
+  host = scriptHost(respond);
+  const paged = await new NativeSourceRunner(pageSource, host, {}).search('凡人', 1);
+  equal(paged.map((b) => [b.name, b.bookUrl, b.kind]), [['{"key":"凡人"}', 'https://api.example.com/sub/x/1',
+    'POST application/json']], 'page() 带地址、对象请求体按 JSON 发送、async 函数');
+
+  // ---------- 变量、临时值、缓存、Cookie、登录、keep、设备 ----------
+  const stateSource = define({
+    ...base,
+    vars: [{ key: 'server', default: 'https://a.example.com' }],
+    js: `
+      function detail(ctx) {
+        const before = vars.get('server');
+        vars.set('server', 'https://b.example.com');
+        vars.set('extra', { n: 1 });
+        temp.set('seen', ctx.book.name);
+        cache.put('token', 'abc', 60);
+        cookie.set('https://api.example.com/', 'sid=1; uid=7');
+        cookie.remove('https://api.example.com/', 'uid');
+        login.save('tok', '我');
+        keep('tab', 'video');
+        return { name: ctx.book.name, kind: [before, login.token, login.user, cookie.get('https://api.example.com/'),
+          device.id, device.ua, native.md5('a').slice(0, 6), uuid().length].join('|') };
+      }
+      function toc(ctx) {
+        return [{ title: temp.get('seen') + cache.get('token') + vars.get('extra').n, url: '/c/1' }];
+      }`,
+    detail: { script: 'detail', fields: { name: '$.name', kind: '$.kind', intro: '= vars.server' } },
+    toc: { script: 'toc', nextUrl: '/never' },
+  });
+  host = scriptHost(respond);
+  const stateRunner = new NativeSourceRunner(stateSource, host, { server: 'https://a.example.com', old: 'kept' });
+  const detail = await stateRunner.detail(book);
+  equal(detail.kind, 'https://a.example.com|tok|我|sid=1|odid-test|UA-test|0cc175|36',
+    '变量读取、登录保存后可读、Cookie 写入与删除、设备信息、native、uuid');
+  equal(detail.intro, 'https://b.example.com', '脚本改了声明的变量，后面的规则立即看到新值');
+  equal(detail.keep, { tab: 'video' }, 'keep 写入详情结果');
+  equal(host.saved.vars, { server: 'https://b.example.com', old: 'kept', extra: { n: 1 } }, '变量连同未声明的键一起保存');
+  equal(host.saved.credential, { token: 'tok', user: '我' }, '登录凭据保存');
+  const chapters = await stateRunner.toc(book);
+  equal(chapters.map((c) => c.title), ['书abc1'], '同一次操作里 temp 保留，cache 与变量可读');
+  equal(host.requests.length, 0, '有 script 时目录不跟随 nextUrl');
+
+  // ---------- 正文：字符串即正文，对象按类型取 ----------
+  const contentSource = define({
+    ...base,
+    js: `
+      function content(ctx) {
+        if (ctx.chapter.index === 0) return '第一段\\n第二段';
+        return { images: ['/i/1.jpg', '/i/2.jpg'] };
+      }`,
+    content: { script: 'content', nextUrl: '/never' },
+  });
+  host = scriptHost(respond);
+  const text = await new NativeSourceRunner(contentSource, host, {}).content(book, chapter);
+  equal([text.kind, text.text], ['text', '第一段\n第二段'], '返回字符串直接作为正文');
+  const comic = await new NativeSourceRunner(contentSource, host, {}).content({ ...book, type: 'comic' }, { ...chapter, index: 1 });
+  equal([comic.kind, comic.images], ['images', ['https://api.example.com/i/1.jpg', 'https://api.example.com/i/2.jpg']],
+    '返回对象时按书籍类型取 images');
+
+  // ---------- 地址字段命中多项时取第一项 ----------
+  const multiSource = define({
+    ...base,
+    js: "function search() { return [{ name: '多链接', u: '\\n /b/1.html\\n/b/1-27.html', c: '/c/1.jpg\\n/c/2.jpg' }]; }",
+    search: { script: 'search', fields: { name: '$.name', bookUrl: '$.u', coverUrl: '$.c' } },
+  });
+  const multi = await new NativeSourceRunner(multiSource, scriptHost(respond), {}).search('a', 1);
+  equal([multi[0].bookUrl, multi[0].coverUrl], ['https://api.example.com/b/1.html', 'https://api.example.com/c/1.jpg'],
+    '地址字段拼成多行时取第一个非空行');
+
+  // ---------- 预算、取消、出错 ----------
+  const budgetSource = define({
+    ...base,
+    scriptLimits: { requests: 3 },
+    js: "function search() { for (let i = 0; i < 5; i++) http.get('/slow?' + i); return []; }",
+    search: { script: 'search' },
+  });
+  await rejects(new NativeSourceRunner(budgetSource, scriptHost(respond), {}).search('a', 1),
+    /搜索脚本 search：.*请求次数超过上限（3 次）/, '请求次数预算');
+
+  const loopSource = define({
+    ...base,
+    js: "function search() { while (true) http.get('/slow'); }",
+    search: { script: 'search' },
+  });
+  host = scriptHost(respond);
+  let stop = false;
+  const startedAt = Date.now();
+  const cancelledRun = new NativeSourceRunner(loopSource, host, {}).setCancelCheck(() => stop).search('a', 1);
+  setTimeout(() => { stop = true; }, 150);
+  await rejects(cancelledRun, /已取消/, '取消正在请求的脚本');
+  assertions++;
+  if (Date.now() - startedAt > 1500) throw new Error(`取消后应很快结束，实际 ${Date.now() - startedAt} ms`);
+
+  const throwSource = define({ ...base, js: "function search() { throw new Error('坏了'); }", search: { script: 'search' } });
+  await rejects(new NativeSourceRunner(throwSource, scriptHost(respond), {}).search('a', 1), /搜索脚本 search：.*坏了/,
+    '脚本抛错带阶段与函数名');
+  const keepSource = define({ ...base, js: "function search() { keep('a', 1); return []; }", search: { script: 'search' } });
+  await rejects(new NativeSourceRunner(keepSource, scriptHost(respond), {}).search('a', 1), /keep 只能在详情阶段使用/,
+    'keep 只能在详情阶段');
+  const cacheSource = define({ ...base, js: "function search() { cache.put('a', 1); return []; }", search: { script: 'search' } });
+  const noCacheHost = scriptHost(respond);
+  delete noCacheHost.cacheGet;
+  delete noCacheHost.cachePut;
+  await rejects(new NativeSourceRunner(cacheSource, noCacheHost, {}).search('a', 1), /当前环境不支持缓存/,
+    '宿主没有缓存时明确报错，不静默丢弃');
+  const noEngine = createTestHost(JsonPathEvaluator, respond);
+  await rejects(new NativeSourceRunner(searchSource, noEngine, {}).search('a', 1), /不支持脚本阶段/, '宿主没有脚本引擎');
+  const catchSource = define({
+    ...base,
+    js: "function search() { try { http.get('/missing'); return [{ name: 'x', bookUrl: '/x' }]; } catch (e) { return []; } }",
+    search: { script: 'search' },
+  });
+  equal((await new NativeSourceRunner(catchSource, scriptHost(respond), {}).search('a', 1)).length, 1,
+    '请求失败不抛错，由脚本看 ok/status 判断');
+
+  // ---------- 表达式环境里不能发请求 ----------
+  const context = vm.createContext({});
+  context.__host = () => 'null';
+  vm.runInContext(NativeJsPrelude.source(NativeExpr.scriptBuiltinNames()), context);
+  vm.runInContext("function fetchIt() { return http.get('/x'); } function logIt() { log('a'); } function id() { return uuid(); }", context);
+  for (const call of ['fetchIt()', 'logIt()']) {
+    assertions++;
+    let message = '';
+    try {
+      vm.runInContext(call, context);
+    } catch (e) {
+      message = e.message;
+    }
+    if (!/表达式里不能发请求/.test(message)) throw new Error(`${call} 应提示改用 script，实际：${message}`);
+  }
+  equal(vm.runInContext('id().length', context), 36, '表达式环境里 uuid 可用');
+
+  // ---------- 定义校验 ----------
+  const invalid = (patch, pattern, message) => {
+    const object = JSON.parse(JSON.stringify({ ...base, js: 'function s() {}', search: { script: 's' } }));
+    patch(object);
+    assertions++;
+    let text = '';
+    try {
+      NativeSourceSpec.fromObject(object);
+    } catch (e) {
+      text = e.message;
+    }
+    if (!pattern.test(text)) throw new Error(`${message}：应当校验失败，实际：${text || '通过'}`);
+  };
+  invalid((o) => { o.search.script = 'a-b'; }, /search\.script 必须是 js 里的函数名/, 'script 不是函数名');
+  invalid((o) => { o.search.script = 'default'; }, /search\.script 必须是 js 里的函数名/, 'script 是保留字');
+  invalid((o) => { delete o.js; }, /search\.script 需要在 js 里定义函数 s/, '有 script 没有 js');
+  invalid((o) => { o.scriptLimits = { requests: 0 }; }, /scriptLimits\.requests/, '请求上限过小');
+  invalid((o) => { o.scriptLimits = { requests: 101 }; }, /scriptLimits\.requests/, '请求上限过大');
+  equal(NativeSourceSpec.validate(define({ ...base, js: 'function s() {}', search: { script: 's' }, scriptLimits: { requests: 100 } })),
+    [], '合法的脚本定义');
+  equal(NativeSourceSpec.scriptFunctions(stateSource), ['detail', 'toc'], '列出阶段 script 用到的函数');
+  equal(NativeJsPrelude.missingMessage(['detail', 'toc'], ['detail']), 'js 里没有阶段 script 用到的函数 “toc”',
+    '导入检查：缺少函数');
+
+  console.log(`Native script stage check passed: ${assertions} assertions.`);
+} finally {
+  mods.cleanup();
+}

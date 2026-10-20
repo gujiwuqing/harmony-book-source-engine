@@ -27,7 +27,7 @@
 | 状态 | **推荐**，新书源请用这种格式 | **已过时**，仅为存量书源保留 |
 | 来历 | 开源轻页自己定义 | Android「阅读」（Legado）的书源格式 |
 | 规则语言 | 声明式规则、自定表达式语言与函数库（`lib`，或用 JavaScript 写的 `js`） | 选择器规则加 JavaScript |
-| 执行方式 | ArkTS 原生执行；只有 `js` 函数库在 QuickJS 里运行，不经过 ArkWeb | 轻量解释器、ArkWeb、QuickJS 分层执行 |
+| 执行方式 | ArkTS 原生执行；`js` 在 QuickJS 里运行（表达式里的函数在主线程，脚本阶段在后台线程），不经过 ArkWeb | 轻量解释器、ArkWeb、QuickJS 分层执行 |
 | 识别方式 | JSON 里带 `"sourceFormat": "native"` | 其余情况 |
 | 文档位置 | [第一部分](#第一部分原生书源) | [第二部分](#第二部分兼容书源已过时) |
 
@@ -265,6 +265,61 @@ fn sign(path, ts) {
 - 只做纯计算：没有网络、Cookie 写入、文件、定时器和网页对象；不支持 `async` 函数或返回 Promise。
 - 单次调用最多 300 ms，载入顶层代码最多 2 秒，内存上限 32 MB，代码长度上限 512 KB。超时或出错时，错误信息里带函数名，例如“JS 函数 “sign” 出错：…”，调试页里对应的规则记录也会标出来。
 - 宿主关闭了主线程同步 QuickJS（`allowSynchronousQuickJs: false`）时，`js` 不可用，调用会报“当前环境不支持 JS 函数库”。
+- 在表达式里调用的函数不能用下一节的 `http`、`vars` 等接口，一用就报“表达式里不能发请求或读写状态，请改用阶段的 script”。
+
+## 脚本阶段 `script`
+
+请求顺序要由代码决定的站点（先取令牌再搜索、按结果循环翻页、批量取详情），可以把一个阶段整个交给 `js` 里的一个函数。在阶段上写 `script: "函数名"`：
+
+```json
+"js": "function search(ctx) {\n  const ids = http.get('/api/search?q=' + encodeURIComponent(ctx.key)).json().ids;\n  return http.all(ids.map(id => '/api/book?id=' + id)).map(r => r.json());\n}",
+"search": {
+  "script": "search",
+  "fields": { "name": "$.title", "author": "$.author", "bookUrl": "= '/book/' + $.id" }
+}
+```
+
+**函数的返回值就是这个阶段的“页面”**，之后的 `let`、`fail`、`list`、`fields`、`text` 等规则照常在上面求值：
+
+| 返回 | 当作 |
+|---|---|
+| 字符串 | 页面原文，选择器照常可用 |
+| 数组或对象 | 已解析的 JSON（`data`），JSONPath 照常可用 |
+| `page(原文, 地址)` | 原文加上它的地址，相对链接按这个地址补全 |
+
+为了少写样板：脚本阶段不写 `list` 时，返回数组的每一项就是一条结果；不写 `fields` 时按同名键取值（书籍取 `name`、`author`、`kind`、`intro`、`coverUrl`、`wordCount`、`lastChapter`、`updateTime`、`status`、`bookUrl`、`tocUrl`、`type`，章节取 `title`、`url`、`isVip`、`isPay`、`isVolume`、`tag`）。正文不写 `text`、`images`、`audio`、`video` 时，返回字符串就是正文，返回对象时按书籍类型取同名键。
+
+- 可以写 `script` 的阶段：`search`、`explore`、`detail`、`toc`、`content`。写了 `script` 的阶段不用写 `url`；`toc` 和 `content` 的翻页由脚本自己处理，**不再跟随 `nextUrl`**。
+- 发现页的分类仍然用 `menus` 声明（没有 `url` 的仍是分组标题）；脚本模式下 `url` 可以写任意标识，函数从 `ctx.url` 读到，`ctx.title` 是分类名，动态分类的条目在 `ctx.menu`。
+- 函数的参数 `ctx` 里有 `stage`、`key`、`page`、`book`、`chapter`、`vars`、`source`、`login`、`baseUrl`、`url`、`title`、`menu`，以及顶层 `cache`、`let` 算出的值。`book.vars` 是书籍变量（只读）。
+- 函数可以是 `async` 的；里面的宿主调用都是同步的，不需要 `await`。
+
+脚本阶段在后台线程运行，可以使用这些接口（只在脚本阶段可用）：
+
+| 接口 | 说明 |
+|---|---|
+| `http.get(地址, 选项?)`、`http.post(地址, 请求体, 选项?)`、`http.request({ url, method, headers, body, charset, retry, webView })` | 同步发请求，返回 `{ ok, status, body, url, error }`，`json()` 解析正文。相对地址按书源地址补全；请求体是对象时按 JSON 发送。请求失败不抛错，看 `ok` 和 `status` |
+| `http.all([请求, …])` | 一组请求并发发出（每批 8 个），按顺序返回 |
+| `vars.get(名)`、`vars.set(名, 值)` | 书源变量，写入后保存（和书源设置页是同一份），可以写没有在 `vars` 里声明的键 |
+| `temp.get(名)`、`temp.set(名, 值)` | 本次操作内的临时值（例如详情阶段记下、目录阶段再用），操作结束就丢 |
+| `cache.get(名)`、`cache.put(名, 值, 有效秒数)` | 内存缓存，按书源分开，重启应用后失效 |
+| `cookie.get(地址, 名?)`、`cookie.set(地址, "a=1; b=2")`、`cookie.remove(地址, 名?)` | 读写这个书源的 Cookie；不写名字时读整条、删全部 |
+| `login.token`、`login.user`、`login.save(令牌, 用户名)` | 读取与保存登录凭据（与表单登录同一份） |
+| `keep(名, 值)` | 只在详情阶段：记进书籍变量，之后的阶段通过 `book.vars.名` 读取 |
+| `log(…)` | 写进调试页的执行明细 |
+| `device.id`、`device.ua` | 设备标识（系统提供的 ODID：同一开发者的应用相同，重装不变）、书源请求用的 User-Agent |
+| `sleep(毫秒)` | 等待，单次最多 5 秒 |
+| `uuid()` | 随机 UUID（表达式里也可用） |
+| `native.名称(…)` | 内置函数，同上一节 |
+| `page(原文, 地址)` | 见上 |
+
+脚本里的请求和声明式请求走同一条请求层：书源请求头、Cookie、限流、编码识别和重试都一样，但遇到验证页不会提示“去验证”。
+
+预算（每次阶段运行）：请求最多 30 次（顶层 `"scriptLimits": { "requests": 1～100 }` 可调）、收到的数据最多 16 MB、脚本自身计算 2 秒（不含等网络的时间）、总时长 60 秒。超出时报错并说明是哪一项。用户离开页面、换源时脚本会立即中止。
+
+报错时说明阶段和函数，例如“搜索脚本 search：Error: 接口返回错误”。调试页里每个请求、`log` 和返回值摘要都记成一条执行明细。
+
+同一份 `js` 在后台的会话会复用（每份最多留 2 个），顶层代码不会每次重新执行，全局变量在多次运行之间保留；它和表达式里调用的那份（主线程）互不相通。需要跨阶段、跨操作保存的值请用 `vars`、`cache` 或 `keep`。
 
 ## 原生书源的顶层字段
 
@@ -281,6 +336,7 @@ fn sign(path, ts) {
 | `vars` | 书源变量，见下 |
 | `lib` | 函数库，见上 |
 | `js` | JS 函数库，见上 |
+| `scriptLimits` | 脚本阶段的预算，见上 |
 | `login` | 账号登录，见下 |
 | `voices` | 听书音色列表，见下 |
 | `cache` | 先取一次、之后复用的值，见下 |
@@ -486,6 +542,8 @@ fn sign(path, ts) {
 
 可用字段：`name`、`author`、`kind`、`intro`、`coverUrl`、`wordCount`、`lastChapter`、`updateTime`、`status`、`bookUrl`、`tocUrl`、`type`。`name` 和 `bookUrl` 必填，缺少任一个的条目会被丢弃。字段求值结果是列表时用逗号连接。地址类字段会按响应地址补全为绝对地址。
 
+选择器命中多个元素时，文本字段把各项按行连起来（例如多段简介）；地址类字段（`bookUrl`、`tocUrl`、`coverUrl`，目录的 `url`，正文的 `audio`、`video`）只取第一个，与兼容书源相同。只想要某一项的文本字段，可以写成 `= first(selAll('…'))`。
+
 `type` 用来逐本声明媒体类型（`text`、`audio`、`comic`、`video`），留空时沿用书源的 `type`。各类型打开后的去向见[媒体类型](#媒体类型)。
 
 ### 发现 `explore`
@@ -669,7 +727,7 @@ fn sign(path, ts) {
 | 选择器（JSONPath、CSS、XPath、正则） | 支持 | 支持 |
 | 条件、拼接、查表、字段整理 | 表达式 | 脚本 |
 | 自定义签名、解密算法 | 内置加解密函数，`lib` 里的自定语法，或原样放进 `js` 的 JavaScript | 脚本 |
-| 追加请求 | `detail.fetch`、`content.fetch`、`comments.stats` | `java.ajax` |
+| 追加请求 | `detail.fetch`、`content.fetch`、`comments.stats`；或在脚本阶段里用 `http.*` | `java.ajax` |
 | 发现页筛选与变量设置 | `vars` 声明，界面由应用生成 | 脚本生成 |
 | 账号登录 | `login` 声明，内置浏览器登录 | 登录面板脚本 |
 | 段评、章末评论入口 | `comments` 声明，应用绘制 | 脚本生成 |
@@ -677,7 +735,7 @@ fn sign(path, ts) {
 | 请求编码与重试 | `charset`、`retry` | URL 选项里的同名字段 |
 | 验证页、登录拦截页 | 主请求自动提示「去验证」 | 同样支持 |
 | 图片、音频的请求头 | `content.mediaHeaders` | 地址后跟选项对象 |
-| 跨请求保存的值（令牌等） | `cache` 声明，带有效期 | 脚本读写缓存和书源变量 |
+| 跨请求保存的值（令牌等） | `cache` 声明，带有效期；脚本阶段里的 `cache`、`vars`、`temp` | 脚本读写缓存和书源变量 |
 | 图片解密 | `content.imageDecode`，标准对称解密 | `imageDecode` 脚本 |
 | 用账号密码调接口登录 | `login.form` 加 `login.submit`，只保存凭据 | 登录面板脚本 |
 | 设置页里的操作按钮 | `actions` 声明 | 登录面板里的按钮脚本 |
@@ -687,11 +745,12 @@ fn sign(path, ts) {
 | 视频内容（短剧等） | `type: video` 加 `content.video`，应用自带播放页 | 只能在正文里放链接，跳到网页播放 |
 | 听书音色 | `voices` 声明列表，听书页点选 | 手动填写音色代码 |
 | 正文里打开网页（如视频播放页） | `content.links` | 脚本生成卡片 |
-| 脚本任意发请求、弹出自定义界面 | 不支持，只能用上面这些声明 | 支持 |
+| 脚本按需发请求、读写变量与 Cookie | 脚本阶段 `script`，同步写法，不需要重放 | 支持（`java.ajax` 等，经 ArkWeb 推测执行和重放） |
+| 脚本弹出提示、自定义界面、打开验证页 | 暂不支持 | 支持 |
 | 向网页注入脚本 | 不支持 | `webJs` |
 | 付费购买章节 | 不支持 | 不支持 |
 
-一条书源只能是一种格式。原生书源里的 JavaScript 只能写在 `js` 里，并且和 `lib` 一样只做纯计算：请求、登录、界面目前都由声明式字段触发。
+一条书源只能是一种格式。原生书源里的 JavaScript 只能写在 `js` 里：表达式里调用的函数只做纯计算；需要发请求、读写状态时，把整个阶段交给 `script`。登录和界面目前仍由声明式字段触发。
 
 ## 已知限制
 
@@ -703,12 +762,14 @@ fn sign(path, ts) {
 - 段评和正文链接按钮只对文本正文生效。
 - 正文分页连第一页在内最多 200 页、拼接后最多 8 MB。逐页跟随时每页都要等上一页返回，几十页的长章节很慢，能算出总页数的站点请用列表写法。
 - 播放页播放的是书源给出的视频流地址，没有弹幕、清晰度切换和手势调节亮度音量。
-- `lib` 和 `js` 都只能做纯计算。请求、登录、按钮都只能按声明执行；需要脚本自己决定发什么请求、弹什么界面的书源目前仍然只能写成兼容书源。
+- 脚本阶段还不能弹提示、刷新页面、打开验证页或自定义界面，书源设置页的按钮也还不能调用脚本；需要这些的书源目前仍然只能写成兼容书源。
+- 脚本阶段只有详情阶段能写书籍变量（`keep`），其他阶段只能读。
 
 ## 实现与验证
 
 - 表达式引擎：`sourceengine/src/main/ets/core/nativesource/NativeExpr.ts`
 - JS 函数库：`NativeJsLibrary.ts`（QuickJS 执行与缓存）、`NativeJsPrelude.ts`（`native` 对象与调用约定，Node 回归共用）
+- 脚本阶段：`NativeScriptHost.ts`（宿主接口的分发与预算）、`NativeScriptSessions.ts`（后台 QuickJS 会话池）；线程模型在 `quickjs/src/main/cpp/script_session.cpp`
 - 定义的解析、校验与存储：`NativeSourceSpec.ts`
 - 阶段执行器：`NativeSourceRunner.ts`
 - 接入请求层与数据模型：`NativeSourceService.ts`
@@ -728,6 +789,7 @@ fn sign(path, ts) {
 ```bash
 node --experimental-strip-types scripts/native-source-check.mjs
 node --experimental-strip-types scripts/native-js-check.mjs
+node --experimental-strip-types scripts/native-script-check.mjs
 node --experimental-strip-types scripts/source-cover-check.mjs
 ```
 

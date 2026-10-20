@@ -7,6 +7,9 @@
 import { CooperativeScheduler } from '../concurrency/CooperativeScheduler';
 import { NativeExpr, NativeExprError, NativeScope } from './NativeExpr';
 import { SourceCoverUrl } from './SourceCoverUrl';
+import { NativeJsPrelude } from './NativeJsPrelude';
+import { NativeScriptHost, NativeScriptLimits } from './NativeScriptHost';
+import type { NativeScriptEngine } from './NativeScriptHost';
 import type { NativeExprHost, NativeScriptLibrary, NativeValue } from './NativeExpr';
 import type {
   NativeActionSpec, NativeCommentsSpec, NativeContentSpec, NativeFetchSpec, NativeMenuSpec, NativeRequestSpec,
@@ -85,6 +88,18 @@ export interface NativeRunnerHost extends NativeExprHost {
   selectItems(content: string, rule: string, baseUrl: string): NativeValue[];
   /** 书源 js 字段的执行器；不提供时调用 JS 函数会报“不支持”。 */
   scriptLibrary?(code: string): NativeScriptLibrary;
+  /** 脚本阶段的后台引擎；不提供时脚本阶段报“不支持”。 */
+  scriptEngine?(code: string): NativeScriptEngine;
+  /** 脚本里的 cookie.*：name 为空时读整条 Cookie、删除全部。 */
+  cookieGet?(url: string, name: string): string;
+  cookieSet?(url: string, value: string): void;
+  cookieRemove?(url: string, name: string): void;
+  /** 脚本写书源变量后保存全部变量（与书源设置页同一份）。 */
+  saveVars?(values: Record<string, NativeValue>): Promise<void>;
+  /** 脚本保存登录凭据（与表单登录同一份）。 */
+  saveCredential?(token: string, user: string): Promise<void>;
+  deviceId?(): string;
+  userAgent?(): string;
 }
 
 export interface NativeBookRecord {
@@ -198,6 +213,13 @@ interface KeptPage {
 type StageReuse = '' | 'keep' | 'take';
 
 const MENU_STATIC = 'native:menu:';
+/** 脚本阶段不写 fields 时，按同名键取值的字段。 */
+const BOOK_FIELD_NAMES = ['name', 'author', 'kind', 'intro', 'coverUrl', 'wordCount', 'lastChapter', 'updateTime',
+  'status', 'bookUrl', 'tocUrl', 'type'];
+const CHAPTER_FIELD_NAMES = ['title', 'url', 'isVip', 'isPay', 'isVolume', 'tag'];
+const STAGE_NAMES: Record<string, string> = {
+  '搜索': 'search', '发现': 'explore', '详情': 'detail', '目录': 'toc', '正文': 'content'
+};
 const MENU_ITEM = 'native:item:';
 const MAX_TOC_PAGES = 1000;
 /** 目录或正文的 nextUrl 一次给出多个地址时，剩余分页每批并发请求的页数；书源可用 batch 改为 1～16。 */
@@ -247,12 +269,20 @@ export class NativeSourceRunner {
   private varValues: Record<string, string>;
   private cancelled: () => boolean = (): boolean => false;
   private credential: NativeLoginCredential = { token: '', user: '' };
+  /** 已保存的全部书源变量，包括没有在 vars 里声明、由脚本写入的键。 */
+  private storedVars: Record<string, NativeValue>;
+  /** 脚本的 temp：只在这个运行器（一次操作）里有效。 */
+  private temp: Map<string, NativeValue> = new Map();
+  /** 详情阶段脚本用 keep() 记下的书籍变量。 */
+  private scriptKeep: Record<string, string> | null = null;
+  private engine: NativeScriptEngine | null = null;
 
   constructor(definition: NativeSourceDefinition, host: NativeRunnerHost, storedVars: Record<string, NativeValue> = {}) {
     this.definition = definition;
     this.host = host;
     this.expr = new NativeExpr(host).loadLibrary(definition.lib).loadScript(NativeSourceRunner.scriptOf(definition, host));
     this.varValues = NativeSourceRunner.resolveVars(definition, storedVars);
+    this.storedVars = Object.assign({}, storedVars || {});
   }
 
   private static scriptOf(definition: NativeSourceDefinition, host: NativeRunnerHost): NativeScriptLibrary | null {
@@ -366,7 +396,7 @@ export class NativeSourceRunner {
   }
 
   async search(key: string, page: number = 1): Promise<NativeBookRecord[]> {
-    const stage = this.requireStage(this.definition.search, '搜索');
+    const stage = this.scripted(this.requireStage(this.definition.search, '搜索'), BOOK_FIELD_NAMES);
     const scope = (await this.baseScope()).set('key', key).set('page', page);
     const loaded = await this.loadStage(stage, scope, '', '搜索');
     return this.readBooks(stage, loaded, 'search');
@@ -429,13 +459,16 @@ export class NativeSourceRunner {
   }
 
   async explore(target: string, page: number = 1): Promise<NativeBookRecord[]> {
-    const explore = this.requireStage(this.definition.explore, '发现');
+    const explore = this.scripted(this.requireStage(this.definition.explore, '发现'), BOOK_FIELD_NAMES);
     const scope = (await this.baseScope()).set('page', page);
     let url = '';
+    let title = '';
+    let menuItem: NativeValue = null;
     let menu: NativeMenuSpec | undefined = undefined;
     if (target.startsWith(MENU_STATIC)) {
       menu = (explore.menus || [])[Number(target.substring(MENU_STATIC.length))];
       url = menu && menu.url ? NativeExpr.toText(this.template(menu.url, scope)) : '';
+      title = menu ? NativeExpr.toText(this.template(menu.title || '', scope)) : '';
     } else if (target.startsWith(MENU_ITEM) && explore.dynamicMenus) {
       let item: NativeValue = null;
       try {
@@ -444,6 +477,7 @@ export class NativeSourceRunner {
         item = null;
       }
       url = NativeExpr.toText(this.value(explore.dynamicMenus.target, scope.child().set('item', item)));
+      menuItem = item;
     }
     if (!url) throw new NativeSourceError('发现分类没有可用的地址');
     const stage: NativeStageSpec = Object.assign({}, explore, {
@@ -452,17 +486,27 @@ export class NativeSourceRunner {
     // 静态分类可以各用各的请求方法和请求体，一个书源对接请求方式不同的几个接口。
     if (menu && menu.method !== undefined) stage.method = menu.method;
     if (menu && menu.body !== undefined) stage.body = menu.body;
-    const loaded = await this.loadStage(stage, scope.child().set('__url', url), '', '发现');
+    const loaded = await this.loadStage(stage,
+      scope.child().set('__url', url).set('__title', title).set('__menuItem', menuItem), '', '发现');
     return this.readBooks(explore, loaded, 'explore');
   }
 
   async detail(book: NativeBookInput): Promise<NativeBookRecord> {
-    const stage = this.definition.detail || {};
+    const stage = this.scripted(this.definition.detail || {}, BOOK_FIELD_NAMES);
     const scope = (await this.baseScope()).set('book', book);
-    const loaded = await this.loadStage(stage, scope, book.bookUrl, '详情', 'keep');
+    this.scriptKeep = stage.script ? {} : null;
+    let loaded: StagePage;
+    let scriptKeep: Record<string, string> = {};
+    try {
+      loaded = await this.loadStage(stage, scope, book.bookUrl, '详情', 'keep');
+      scriptKeep = this.scriptKeep || {};
+    } finally {
+      this.scriptKeep = null;
+    }
     await this.runExtraFetches(this.definition.detail ? this.definition.detail.fetch : undefined, loaded);
     const record = this.readBook(stage.fields || {}, loaded.scope, loaded.baseUrl, 'detail');
     if (!record.bookUrl) record.bookUrl = book.bookUrl;
+    for (const key of Object.keys(scriptKeep)) record.keep[key] = scriptKeep[key];
     const keep = this.definition.detail ? this.definition.detail.keep : undefined;
     if (keep) {
       for (const key of Object.keys(keep)) {
@@ -473,7 +517,7 @@ export class NativeSourceRunner {
   }
 
   async toc(book: NativeBookInput, limit: number = 0): Promise<NativeChapterRecord[]> {
-    const stage = this.requireStage(this.definition.toc, '目录');
+    const stage = this.scripted(this.requireStage(this.definition.toc, '目录'), CHAPTER_FIELD_NAMES);
     const chapters: NativeChapterRecord[] = [];
     const visited: Set<string> = new Set();
     const defaultUrl = book.tocUrl || book.bookUrl;
@@ -490,7 +534,8 @@ export class NativeSourceRunner {
       const full = await this.appendTocPage(stage, loaded, chapters, limit, pacer);
       if (this.cancelled()) return [];
       if (full) break;
-      if (!stage.nextUrl) break;
+      // 脚本阶段自己处理翻页。
+      if (!stage.nextUrl || stage.script) break;
       const pending = this.nextUrls(stage.nextUrl, loaded, 'toc.nextUrl').filter((url: string): boolean => !visited.has(url));
       if (pending.length === 0) break;
       if (pending.length === 1) {
@@ -531,7 +576,7 @@ export class NativeSourceRunner {
       if (!title) continue;
       const isVolume = NativeExpr.isTruthy(this.value(fields['isVolume'], itemScope, false, 'toc.fields.isVolume'));
       const url = NativeExpr.resolveUrl(
-        NativeExpr.toText(this.value(fields['url'], itemScope, false, 'toc.fields.url')), loaded.baseUrl);
+        this.firstLine(this.first(this.value(fields['url'], itemScope, false, 'toc.fields.url'))), loaded.baseUrl);
       if (!url && !isVolume) continue;
       chapters.push({
         title: title,
@@ -590,7 +635,7 @@ export class NativeSourceRunner {
   }
 
   async content(book: NativeBookInput, chapter: NativeChapterInput): Promise<NativeContentResult> {
-    const stage = this.requireStage(this.definition.content, '正文');
+    const stage = this.scriptedContent(this.requireStage(this.definition.content, '正文'));
     const bookType = String(book.type || this.definition.type || 'text').toLowerCase();
     const kind = bookType === 'video' && stage.video ? 'video' : (bookType === 'audio' && stage.audio ? 'audio' :
       ((bookType === 'comic' || bookType === 'image') && stage.images ? 'images' :
@@ -606,8 +651,8 @@ export class NativeSourceRunner {
     const firstBase = firstPage.baseUrl;
     await this.runExtraFetches(stage.fetch, firstPage);
     if (kind === 'audio' || kind === 'video') {
-      const audio = NativeExpr.toText(this.first(this.value(kind === 'audio' ? stage.audio : stage.video,
-        firstPage.scope, false, `content.${kind}`))).trim();
+      const audio = this.firstLine(this.first(this.value(kind === 'audio' ? stage.audio : stage.video,
+        firstPage.scope, false, `content.${kind}`)));
       if (!audio) throw new NativeSourceError(this.mediaFailure(stage, firstPage, kind));
       return {
         kind: kind, text: NativeExpr.resolveUrl(audio, firstPage.baseUrl), baseUrl: firstPage.baseUrl,
@@ -623,7 +668,7 @@ export class NativeSourceRunner {
     let loaded = firstPage;
     let page = 1;
     let skipped = 0;
-    while (stage.nextUrl) {
+    while (stage.nextUrl && !stage.script) {
       if (this.cancelled()) return empty(firstBase);
       const pending = this.nextUrls(stage.nextUrl, loaded, 'content.nextUrl')
         .filter((url: string): boolean => !visited.has(url));
@@ -853,6 +898,7 @@ export class NativeSourceRunner {
   /** 请求一个阶段的页面并准备好求值环境；地址渲染为空时不发请求。reuse 见 StageReuse。 */
   private async loadStage(stage: NativeStageSpec, scope: NativeScope, defaultUrl: string, label: string,
     reuse: StageReuse = ''): Promise<StagePage> {
+    if (stage.script) return this.finishStage(stage, await this.loadScriptStage(stage, scope, label), label);
     const request = this.buildRequest(stage, scope, defaultUrl, true);
     let body = '';
     let baseUrl = request.url || NativeExpr.toText(scope.get('baseUrl'));
@@ -876,13 +922,145 @@ export class NativeSourceRunner {
         if (reuse === 'keep') NativeSourceRunner.keepPage(key, body, baseUrl);
       }
     }
-    const pageScope = this.responseScope(scope, body, baseUrl);
-    this.applyLets(stage.let, pageScope);
+    return this.finishStage(stage, { scope: this.responseScope(scope, body, baseUrl), baseUrl: baseUrl }, label);
+  }
+
+  /** 页面到手之后：阶段的 let 与 fail。 */
+  private finishStage(stage: NativeStageSpec, page: StagePage, label: string): StagePage {
+    this.applyLets(stage.let, page.scope);
     if (stage.fail) {
-      const failure = NativeExpr.toText(this.value(stage.fail, pageScope, false, 'fail')).trim();
+      const failure = NativeExpr.toText(this.value(stage.fail, page.scope, false, 'fail')).trim();
       if (failure && failure !== 'false') throw new NativeSourceError(`${label}接口返回失败：${failure}`);
     }
+    return page;
+  }
+
+  /**
+   * 脚本阶段：在后台运行 js 里的函数，它的返回值就是这个阶段的“页面”。字符串当作原文，数组或对象当作
+   * 已解析的 JSON，page(body, url) 带上页面地址。之后的 list、fields 等规则照常在上面求值。
+   */
+  private async loadScriptStage(stage: NativeStageSpec, scope: NativeScope, label: string): Promise<StagePage> {
+    const fn = String(stage.script || '').trim();
+    const stageName = STAGE_NAMES[label] || label;
+    const limits = NativeScriptLimits.of(this.definition.scriptLimits ? this.definition.scriptLimits.requests : undefined);
+    const scriptHost = new NativeScriptHost({
+      host: this.host,
+      sourceUrl: this.definition.url,
+      stage: stageName,
+      fn: fn,
+      limits: limits,
+      cancelled: this.cancelled,
+      builtin: (name: string, args: NativeValue[]): NativeValue => this.expr.callBuiltin(name, args, scope),
+      getVar: (key: string): NativeValue => this.getVar(key),
+      setVar: (key: string, value: NativeValue): Promise<void> => this.setVar(key, value),
+      temp: this.temp,
+      credential: (): NativeValue => ({ token: this.credential.token, user: this.credential.user }),
+      saveCredential: (token: string, user: string): Promise<void> => this.saveCredential(token, user),
+      keep: stageName === 'detail' ? this.scriptKeep : null
+    });
+    const startedAt = Date.now();
+    let value: NativeValue;
+    try {
+      value = await this.scriptEngine().run(fn, this.scriptContext(scope, stageName), scriptHost.handler(), {
+        cpuMs: limits.cpuMs, wallMs: limits.wallMs, cancelled: this.cancelled
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      this.traceScript(stageName, fn, 'return', '', message);
+      throw new NativeSourceError(`${label}脚本 ${fn}：${message}`);
+    }
+    let baseUrl = NativeExpr.toText(scope.get('baseUrl')) || this.definition.url;
+    let pageScope: NativeScope;
+    if (NativeJsPrelude.isPage(value) || typeof value === 'string') {
+      const body = typeof value === 'string' ? value : NativeExpr.toText(value['body']);
+      const pageUrl = typeof value === 'string' ? '' : NativeExpr.toText(value['url']).trim();
+      if (pageUrl) baseUrl = NativeExpr.resolveUrl(pageUrl, this.definition.url);
+      pageScope = this.responseScope(scope, body, baseUrl);
+    } else {
+      pageScope = scope.child().set('body', value === null || value === undefined ? '' : JSON.stringify(value))
+        .set('data', value === undefined ? null : value).set('item', value === undefined ? null : value)
+        .set('baseUrl', baseUrl);
+    }
+    const data = pageScope.get('data');
+    pageScope.set('__items', Array.isArray(data) ? data : (data === null || data === undefined ? [] : [data]));
+    this.traceScript(stageName, fn, 'return', `${Array.isArray(data) ? `${data.length} 项` :
+      (data !== null ? '对象' : `${NativeExpr.toText(pageScope.get('body')).length} 字`)}，请求 ${scriptHost.requestCount} 次，` +
+      `${Date.now() - startedAt} ms`, '');
     return { scope: pageScope, baseUrl: baseUrl };
+  }
+
+  /** 传给脚本函数的 ctx：与规则里可用的名字一致。 */
+  private scriptContext(scope: NativeScope, stageName: string): Record<string, NativeValue> {
+    const ctx: Record<string, NativeValue> = { stage: stageName };
+    for (const name of ['key', 'page', 'book', 'chapter', 'source', 'login', 'baseUrl']) ctx[name] = scope.get(name);
+    for (const name of Object.keys(this.definition.cache || {}).concat(Object.keys(this.definition.let || {}))) {
+      ctx[name] = scope.get(name);
+    }
+    ctx['vars'] = Object.assign({}, this.storedVars, this.varValues);
+    ctx['url'] = scope.has('__url') ? NativeExpr.toText(scope.get('__url')) : '';
+    ctx['title'] = scope.has('__title') ? NativeExpr.toText(scope.get('__title')) : '';
+    ctx['menu'] = scope.has('__menuItem') ? scope.get('__menuItem') : null;
+    return ctx;
+  }
+
+  private scriptEngine(): NativeScriptEngine {
+    if (this.engine) return this.engine;
+    const code = this.definition.js || '';
+    if (!code.trim()) throw new NativeSourceError('阶段写了 script，但书源没有 js');
+    if (!this.host.scriptEngine) throw new NativeSourceError('当前环境不支持脚本阶段');
+    this.engine = this.host.scriptEngine(code);
+    return this.engine;
+  }
+
+  private getVar(key: string): NativeValue {
+    if (Object.prototype.hasOwnProperty.call(this.varValues, key)) return this.varValues[key];
+    const value = this.storedVars[key];
+    return value === undefined ? null : value;
+  }
+
+  private async setVar(key: string, value: NativeValue): Promise<void> {
+    if (!key) throw new Error('变量名不能为空');
+    this.storedVars[key] = value;
+    if (Object.prototype.hasOwnProperty.call(this.varValues, key)) {
+      this.varValues[key] = value === null || value === undefined ? '' : NativeExpr.toText(value);
+    }
+    if (!this.host.saveVars) throw new Error('当前环境不支持保存书源变量');
+    await this.host.saveVars(Object.assign({}, this.storedVars, this.varValues));
+  }
+
+  private async saveCredential(token: string, user: string): Promise<void> {
+    if (!this.host.saveCredential) throw new Error('当前环境不支持保存登录凭据');
+    await this.host.saveCredential(token, user);
+    this.credential = { token: token, user: user };
+  }
+
+  /** 脚本阶段没写 list、fields 时：返回的数组每项一条，字段按同名键取值。 */
+  private scripted<T extends NativeStageSpec>(stage: T, fieldNames: string[]): T {
+    if (!stage.script) return stage;
+    const copy = Object.assign({}, stage) as T;
+    if (!copy.list) copy.list = '= __items';
+    if (!copy.fields) {
+      const fields: Record<string, NativeValue> = {};
+      for (const name of fieldNames) fields[name] = `$.${name}`;
+      copy.fields = fields;
+    }
+    return copy;
+  }
+
+  /** 脚本正文没写 text、images、audio、video 时：返回字符串即正文，返回对象时按同名键取。 */
+  private scriptedContent(stage: NativeContentSpec): NativeContentSpec {
+    if (!stage.script || stage.text || stage.images || stage.audio || stage.video) return stage;
+    return Object.assign({}, stage, {
+      text: '= data != null ? $.text : body',
+      images: '= data != null ? $.images : []',
+      audio: '= data != null ? $.audio : body',
+      video: '= data != null ? $.video : body'
+    });
+  }
+
+  private traceScript(stageName: string, fn: string, rule: string, preview: string, error: string): void {
+    if (!this.host.trace) return;
+    this.host.trace({ field: `${stageName}.script ${fn}`, rule: rule, type: 'script', count: 1, preview: preview, error: error });
   }
 
   /** 请求的完整特征：书源加上地址、方法、请求头、请求体与取页方式，全部相同才算同一个请求。 */
@@ -1038,8 +1216,8 @@ export class NativeSourceRunner {
       return (Array.isArray(value) ? value.map((part: NativeValue): string => NativeExpr.toText(part).trim())
         .filter((part: string): boolean => !!part).join(',') : NativeExpr.toText(value)).trim();
     };
-    const url = (name: string): string => NativeExpr.resolveUrl(NativeExpr.toText(this.first(
-      this.value(fields[name], scope, false, `${prefix}.fields.${name}`))).trim(), baseUrl);
+    const url = (name: string): string => NativeExpr.resolveUrl(this.firstLine(this.first(
+      this.value(fields[name], scope, false, `${prefix}.fields.${name}`))), baseUrl);
     const typeSpec = fields['type'];
     const literalType = typeof typeSpec === 'string' && /^(text|audio|comic|image|video)$/i.test(typeSpec.trim());
     return {
@@ -1057,6 +1235,18 @@ export class NativeSourceRunner {
       type: (literalType ? String(typeSpec).trim() : text('type')).toLowerCase(),
       keep: {}
     };
+  }
+
+  /**
+   * 地址类字段只取第一项：选择器命中多个元素时，非列表求值会把结果按行拼起来（简介等文本需要这样），
+   * 而地址里不会有换行，取第一行与兼容书源“地址取第一个”的行为一致。
+   */
+  private firstLine(value: NativeValue): string {
+    for (const line of NativeExpr.toText(value).split(/\r?\n/)) {
+      const text = line.trim();
+      if (text) return text;
+    }
+    return '';
   }
 
   private first(value: NativeValue): NativeValue {
