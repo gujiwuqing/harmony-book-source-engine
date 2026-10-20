@@ -121,6 +121,14 @@ try {
     if (diffs.length > 0) throw new Error(`选择器结果与基准不一致（${diffs.length} 条）：\n${diffs.slice(0, 10).join('\n')}`);
   }
 
+  // 属性值跨行（例如多行的 og:description）时整段取出，不能只取到一个引号。
+  const multiline = '<head><meta property="og:description" content="  第一行\n  第二行“引号”\n" /></head>';
+  for (const rule of ['@css:meta[property="og:description"]@content', "@css:meta[property='og:description']@content"]) {
+    assertions++;
+    const value = new AnalyzeRule(multiline, BASE_URL).getString(rule);
+    if (!/第一行[\s\S]*第二行“引号”/.test(value)) throw new Error(`跨行属性值取值不对：${rule} => ${JSON.stringify(value)}`);
+  }
+
   // HTML 目录取字段耗时（参考值，不做断言）。
   const timings = [];
   for (const count of [1000, 8000]) {
