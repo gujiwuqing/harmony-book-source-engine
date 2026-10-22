@@ -202,9 +202,13 @@ export interface NativeContentLink {
 
 /** 图片解密参数，密钥与 IV 为十六进制。 */
 export interface NativeImageDecode {
+  script?: string;
+  params?: Record<string, NativeValue>;
+  processPlainImages?: boolean;
   algorithm: string;
   key: string;
   iv: string;
+  ivPrefixBytes?: number;
 }
 
 export class NativeSourceError extends Error {
@@ -587,9 +591,11 @@ export class NativeSourceRunner {
     // 静态分类可以各用各的请求方法和请求体，一个书源对接请求方式不同的几个接口。
     if (menu && menu.method !== undefined) stage.method = menu.method;
     if (menu && menu.body !== undefined) stage.body = menu.body;
+    if (menu && menu.list !== undefined) stage.list = menu.list;
+    if (menu && menu.fields !== undefined) stage.fields = menu.fields;
     const loaded = await this.loadStage(stage,
       scope.child().set('__url', url).set('__title', title).set('__menuItem', menuItem), '', '发现');
-    return this.readBooks(explore, loaded, 'explore');
+    return this.readBooks(stage, loaded, 'explore');
   }
 
   async detail(book: NativeBookInput): Promise<NativeBookRecord> {
@@ -827,16 +833,47 @@ export class NativeSourceRunner {
     };
     if (kind === 'images' && stage.imageDecode && firstPage) {
       const decode = stage.imageDecode;
-      const toHex = (value: NativeValue): string => {
-        const bytes: number[] = Array.isArray(value) ? value : this.expr.evaluate('bytes(__text)',
-          new NativeScope().set('__text', NativeExpr.toText(value)));
-        return bytes.map((byte: number): string => ((byte & 255) < 16 ? '0' : '') + (byte & 255).toString(16)).join('');
-      };
-      result.imageDecode = {
-        algorithm: NativeExpr.toText(this.template(decode.algorithm, firstPage.scope)).trim(),
-        key: toHex(this.value(decode.key, firstPage.scope, false, 'content.imageDecode.key')),
-        iv: decode.iv ? toHex(this.value(decode.iv, firstPage.scope, false, 'content.imageDecode.iv')) : ''
-      };
+      if (decode.script !== undefined) {
+        const params = this.renderDeep(decode.params || {}, firstPage.scope) as Record<string, NativeValue>;
+        if (JSON.stringify(params).length > 16384) {
+          throw this.fieldError('content.imageDecode.params', '', new Error('参数不能超过 16384 字符'));
+        }
+        result.imageDecode = { algorithm: '', key: '', iv: '', script: decode.script.trim(),
+          params: params, processPlainImages: decode.processPlainImages === true };
+      } else {
+        const toHex = (value: NativeValue): string => {
+          const bytes: number[] = Array.isArray(value) ? value : this.expr.evaluate('bytes(__text)',
+            new NativeScope().set('__text', NativeExpr.toText(value)));
+          return bytes.map((byte: number): string => ((byte & 255) < 16 ? '0' : '') + (byte & 255).toString(16)).join('');
+        };
+        let key = '';
+        if (decode.keyEncoding !== undefined) {
+          const value = NativeExpr.toText(this.template(decode.key || '', firstPage.scope));
+          if (decode.keyEncoding === 'hex') {
+            if (!/^(?:[a-f0-9]{2})+$/i.test(value)) {
+              throw this.fieldError('content.imageDecode.key', '', new Error('keyEncoding:hex 需要完整的十六进制字节'));
+            }
+            key = value.toLowerCase();
+          } else {
+            key = toHex(value);
+          }
+        } else {
+          key = toHex(this.value(decode.key || '', firstPage.scope, false, 'content.imageDecode.key'));
+        }
+        if (!key) throw this.fieldError('content.imageDecode.key', '',
+          new Error('密钥求值为空；固定密钥请声明 keyEncoding，或用 = 开头的字符串表达式'));
+        if (decode.keyEncoding !== undefined || decode.ivPrefixBytes !== undefined) {
+          const sizes = /^aes\//i.test(decode.algorithm || '') ? [16, 24, 32] : [24];
+          if (!sizes.includes(key.length / 2)) throw this.fieldError('content.imageDecode.key', '',
+            new Error(`密钥长度应为 ${sizes.join('/')} 字节，当前为 ${key.length / 2} 字节`));
+        }
+        result.imageDecode = {
+          algorithm: NativeExpr.toText(this.template(decode.algorithm || '', firstPage.scope)).trim(),
+          key: key,
+          iv: decode.iv ? toHex(this.value(decode.iv, firstPage.scope, false, 'content.imageDecode.iv')) : ''
+        };
+        if (decode.ivPrefixBytes !== undefined) result.imageDecode.ivPrefixBytes = decode.ivPrefixBytes;
+      }
     }
     if (kind === 'text' && firstPage) {
       const links = stage.links || [];
@@ -1000,7 +1037,9 @@ export class NativeSourceRunner {
   private async loadStage(stage: NativeStageSpec, scope: NativeScope, defaultUrl: string, label: string,
     reuse: StageReuse = ''): Promise<StagePage> {
     if (stage.script) return this.finishStage(stage, await this.loadScriptStage(stage, scope, label), label);
-    const request = this.buildRequest(stage, scope, defaultUrl, true);
+    const request = this.buildRequest(stage, scope, defaultUrl, true, `${STAGE_NAMES[label] || label}.url`);
+    this.traceRule(`${STAGE_NAMES[label] || label}.url`, stage.url === undefined ? '(默认地址)' : stage.url,
+      request.url, false);
     let body = '';
     let baseUrl = request.url || NativeExpr.toText(scope.get('baseUrl'));
     if (request.url) {
@@ -1228,8 +1267,13 @@ export class NativeSourceRunner {
   }
 
   private buildRequest(spec: NativeRequestSpec, scope: NativeScope, defaultUrl: string,
-    primary: boolean = false): NativeRequest {
-    const rawUrl = spec.url === undefined ? defaultUrl : NativeExpr.toText(this.template(spec.url, scope));
+    primary: boolean = false, urlField: string = ''): NativeRequest {
+    let rawUrl: string;
+    try {
+      rawUrl = spec.url === undefined ? defaultUrl : NativeExpr.toText(this.template(spec.url, scope));
+    } catch (error) {
+      throw this.fieldError(urlField, spec.url, error);
+    }
     const url = NativeExpr.resolveUrl(rawUrl.trim(), this.definition.url);
     const headers: Record<string, string> = {};
     for (const name of Object.keys(spec.headers || {})) {
@@ -1340,12 +1384,17 @@ export class NativeSourceRunner {
       this.value(fields[name], scope, false, `${prefix}.fields.${name}`))), baseUrl);
     const typeSpec = fields['type'];
     const literalType = typeof typeSpec === 'string' && /^(text|audio|comic|image|video)$/i.test(typeSpec.trim());
+    const coverHeaders = Object.assign({},
+      SourceCoverUrl.cleanHeaders(this.renderHeaders(this.definition.headers, scope)),
+      SourceCoverUrl.cleanHeaders(this.renderHeaders(this.definition.coverHeaders, scope)));
+    const cover = url('coverUrl');
     return {
       name: text('name'),
       author: text('author'),
       kind: text('kind'),
       intro: text('intro'),
-      coverUrl: this.definition.coverDecode ? SourceCoverUrl.wrap(url('coverUrl'), this.definition.url) : url('coverUrl'),
+      coverUrl: this.definition.coverDecode || Object.keys(coverHeaders).length > 0 ?
+        SourceCoverUrl.wrap(cover, this.definition.url, coverHeaders) : cover,
       wordCount: text('wordCount'),
       lastChapter: text('lastChapter'),
       updateTime: text('updateTime'),
