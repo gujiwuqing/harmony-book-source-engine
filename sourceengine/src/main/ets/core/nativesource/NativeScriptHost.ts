@@ -66,6 +66,8 @@ export interface NativeScriptContext {
    * 搜索、发现是多个书源同时跑的，不弹网页，browser.verify 改走「去验证」。
    */
   interactive: boolean;
+  /** 脚本请求实际带的请求头：顶层 headers 按当前作用域求值，再叠上脚本给出的（同名以脚本为准）。 */
+  requestHeaders: (own: Record<string, string>) => Record<string, string>;
 }
 
 const BATCH = 8;
@@ -174,7 +176,7 @@ export class NativeScriptHost {
         return this.render(this.url(args[0]), args[1]);
       case '@device': {
         const host = this.context.host;
-        if (this.text(args[0]) === 'ua') return host.userAgent ? host.userAgent() : '';
+        if (this.text(args[0]) === 'ua') return this.userAgent();
         return host.deviceId ? host.deviceId() : '';
       }
       default:
@@ -282,13 +284,24 @@ export class NativeScriptHost {
     const web = spec['webView'];
     const webSpec: Record<string, NativeValue> | null = web && typeof web === 'object' ? web as Record<string, NativeValue> : null;
     return {
-      url: url, method: method, headers: headers, body: body, webView: web === true || !!webSpec,
+      url: url, method: method, headers: this.context.requestHeaders(headers), body: body,
+      webView: web === true || !!webSpec,
       webWaitFor: webSpec && webSpec['waitFor'] ? String(webSpec['waitFor']).trim() : '',
       webTimeout: Math.max(3, Math.min(Number(webSpec ? webSpec['timeout'] : 0) || 15, 60)),
       charset: this.text(spec['charset']).trim(),
       retry: Math.max(0, Math.min(Math.floor(Number(spec['retry']) || 0), 3)),
       primary: false
     };
+  }
+
+  /** 书源请求用的 User-Agent：顶层 headers 里写了（可以是模板）就用求值后的值，否则用宿主默认的。 */
+  private userAgent(): string {
+    const headers = this.context.requestHeaders({});
+    for (const name of Object.keys(headers)) {
+      if (name.toLowerCase() === 'user-agent') return headers[name];
+    }
+    const host = this.context.host;
+    return host.userAgent ? host.userAgent() : '';
   }
 
   private cookieHost(action: string): NativeRunnerHost {
