@@ -548,7 +548,13 @@ export class NativeSourceRunner {
       } catch (e) {
         if (entries.length === 0) throw e;
       }
-      if (page) this.readMenuItems(dynamic, page.scope, page.baseUrl, entries);
+      if (page) {
+        // 返回的是“名称::地址”文本（与兼容书源的 exploreUrl 相同）时，拆成分类数组。
+        if (!(explore.dynamicMenus && explore.dynamicMenus.list) && page.scope.get('data') === null) {
+          page.scope.set('__items', NativeSourceRunner.menuTextItems(NativeExpr.toText(page.scope.get('body'))));
+        }
+        this.readMenuItems(dynamic, page.scope, page.baseUrl, entries);
+      }
     } else if (dynamic) {
       const request = this.buildRequest(dynamic, scope, '');
       if (request.url) {
@@ -575,6 +581,21 @@ export class NativeSourceRunner {
       const hasTarget = NativeExpr.isTruthy(this.value(dynamic.target || '', itemScope.child().set('page', 1)));
       entries.push({ title: title, target: hasTarget ? MENU_ITEM + JSON.stringify(item) : '' });
     }
+  }
+
+  /** “名称::地址”文本按行或 && 分成分类；没有 :: 的是分组标题。 */
+  private static menuTextItems(text: string): NativeValue[] {
+    const items: NativeValue[] = [];
+    for (const part of text.split(/&&|\r?\n/)) {
+      const line = part.trim();
+      if (!line) continue;
+      const at = line.indexOf('::');
+      const title = (at < 0 ? line : line.substring(0, at)).trim();
+      const url = at < 0 ? '' : line.substring(at + 2).trim();
+      if (!title) continue;
+      items.push(url ? { title: title, url: url } : { title: title });
+    }
+    return items;
   }
 
   /** 脚本分类没写 list、title、target 时：返回数组的每项一条，按 title、url 取，url 里的 {{page}} 换成页码。 */

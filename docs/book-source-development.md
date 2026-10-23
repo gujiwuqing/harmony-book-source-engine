@@ -403,7 +403,7 @@ fn sign(path, ts) {
 | `login.sendCode.script` | 从 `ctx.form` 取账号等，返回提示字符串或带 `message` 的对象 |
 | `actions[].script` | `ctx.action` 是按钮文字，返回字符串或 `{ message }`；可写变量后调用 `ui.refreshExplore()` |
 | `vars[].optionsScript` | `ctx.key` 是变量名，返回非空字符串数组；失败或空结果时由设置页回退到静态 `options` |
-| `explore.dynamicMenus.script` | `ctx.stage` 是 `menus`，返回分类数组 `[{ title, url }]`；不发 `url` 请求，不能打开网页 |
+| `explore.dynamicMenus.script` | `ctx.stage` 是 `menus`，返回分类数组 `[{ title, url }]` 或 `名称::地址` 文本；不发 `url` 请求，不能打开网页 |
 
 这些函数同样写在顶层 `js` 中，通过字段引用函数名，不能在 `script` 字段直接塞一段 JS。设置布局仍由应用绘制，脚本不能新增任意控件。`browser.verify`、`ui.toast`、`ui.refreshExplore` 依赖宿主的 `NativeSourceInteraction` 接入；`browser.render` 依赖网页抓取宿主。轻页已接入，其他宿主需单独确认。
 
@@ -687,7 +687,7 @@ fn sign(path, ts) {
 - `menus` 是固定分类。没有 `url` 的条目是分组标题，`when` 为假时该条目隐藏。条目可以带 `headers`，只在打开这个分类时附加，适合个人书架这类需要登录凭据的分类。条目也可以带自己的 `method`、`body`，不写时沿用 `explore` 上的；`body` 写空串表示这个分类不带请求体。这样一个书源可以同时对接 GET 和 POST 两种接口，例如 `{ "title": "筛选", "url": "{{server}}/filter", "method": "POST", "body": "= tojson({page: page, sort: 'hot'})" }`。
 - 每个菜单还可设置自己的 `list`、`fields`；两者分别回退到 `explore` 的同名配置。设置 `fields` 时整组替换，不逐字段合并，仍须包含 `name`、`bookUrl`。例如 `{ "title": "VIP", "url": "/api/home", "list": "$.data.vipList[*]", "fields": { "name": "$.title", "bookUrl": "$.url" } }`。所有可点击菜单都提供完整规则时，可以省略全局 `list/fields`；动态分类仍使用全局规则。
 - `dynamicMenus` 从接口取分类。`target` 在打开分类时才求值，所以里面可以用 `page`；求值为空的条目作为分组标题。
-- 分类要按变量、缓存或别的计算得出，而不是来自某个接口时，`dynamicMenus` 写 `script`（`js` 里的函数名），不写 `url`。打开发现页时运行这个函数，它返回分类数组；`list` 默认取数组的每一项，`title` 默认 `$.title`，`target` 默认 `$.url`，`url` 里的 `{{page}}` 在打开分类时换成页码，没有 `url` 的条目是分组标题。返回值的形状不同时照样可以自己写 `list`、`title`、`target`。函数的 `ctx.stage` 是 `menus`，可以读 `ctx.vars`、发请求、读写 `cache`，但和发现阶段一样不能打开网页。函数出错时，有固定分类就只显示固定分类，没有就报出原因。
+- 分类要按变量、缓存或别的计算得出，而不是来自某个接口时，`dynamicMenus` 写 `script`（`js` 里的函数名），不写 `url`。打开发现页时运行这个函数，它返回分类数组；`list` 默认取数组的每一项，`title` 默认 `$.title`，`target` 默认 `$.url`，`url` 里的 `{{page}}` 在打开分类时换成页码，没有 `url` 的条目是分组标题。也可以像兼容书源的 `exploreUrl` 那样返回 `名称::地址` 文本：按行或 `&&` 分隔，只按第一个 `::` 切分，没有 `::` 的行是分组标题，从兼容书源迁移时拼文本的 JS 可以原样保留（返回 JSON 文本时按数组处理）。返回值的形状不同时照样可以自己写 `list`、`title`、`target`，这时不再按 `::` 拆分。函数的 `ctx.stage` 是 `menus`，可以读 `ctx.vars`、发请求、读写 `cache`，但和发现阶段一样不能打开网页。函数出错时，有固定分类就只显示固定分类，没有就报出原因。
 
 ```json
 "js": "function menus(ctx) {\n  var kinds = ctx.vars.mode === '听书' ? ['有声'] : ['玄幻', '都市'];\n  return [{ title: '分类' }].concat(kinds.map(function (k) {\n    return { title: k, url: '/list?kind=' + encodeURIComponent(k) + '&page={{page}}' };\n  }));\n}",

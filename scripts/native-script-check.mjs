@@ -406,6 +406,30 @@ try {
   const customEntries = await customRunner.exploreMenus();
   equal(customEntries.map((m) => m.title), ['甲'], '脚本分类也可以自己写 list、title');
   await customRunner.explore(customEntries[0].target, 3);
+  // 与兼容书源 exploreUrl 相同的“名称::地址”文本：按行或 && 分隔，没有 :: 的是分组标题。
+  const textMenus = define({
+    ...base,
+    js: "function menus() { return '排行\\n 热门 :: /rank/hot?page={{page}} && 完结::/rank/end?a=1::2\\n\\n&&'; }\n" +
+      "function jsonMenus() { return JSON.stringify([{ title: 'JSON', url: '/j?p={{page}}' }]); }",
+    explore: {
+      menus: [{ title: '固定', url: '/fixed' }],
+      dynamicMenus: { script: 'menus' },
+      list: '$.books[*]',
+      fields: { name: '$.name', bookUrl: '$.id' },
+    },
+  });
+  host = scriptHost(async (request) => JSON.stringify({ books: [{ name: request.url, id: '/b/1' }] }));
+  const textRunner = new NativeSourceRunner(textMenus, host, {});
+  const textEntries = await textRunner.exploreMenus();
+  equal(textEntries.map((m) => [m.title, !!m.target]), [['固定', true], ['排行', false], ['热门', true], ['完结', true]],
+    '“名称::地址”文本：按行和 && 拆分，空段跳过，没有 :: 的是分组标题');
+  equal((await textRunner.explore(textEntries[2].target, 4))[0].name, 'https://api.example.com/rank/hot?page=4',
+    '文本分类的地址去掉两边空白，{{page}} 换成页码');
+  equal((await textRunner.explore(textEntries[3].target, 1))[0].name, 'https://api.example.com/rank/end?a=1::2',
+    '只按第一个 :: 切分，地址里的 :: 保留');
+  const jsonText = define({ ...textMenus, explore: { ...textMenus.explore, menus: undefined, dynamicMenus: { script: 'jsonMenus' } } });
+  equal((await new NativeSourceRunner(jsonText, scriptHost(respond), {}).exploreMenus()).map((m) => m.title), ['JSON'],
+    '返回 JSON 文本时仍按数组取');
   const brokenOnly = define({ ...menuSource, explore: { ...menuSource.explore, menus: undefined, dynamicMenus: { script: 'brokenMenus' } } });
   await rejects(new NativeSourceRunner(brokenOnly, scriptHost(respond), {}).exploreMenus(), /发现分类脚本 brokenMenus：.*分类坏了/,
     '只有脚本分类且出错时报出原因');
