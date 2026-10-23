@@ -1545,7 +1545,7 @@ fn sign(path, ts) {
 | --- | --- |
 | `bookSourceUrl`、`bookSourceName`、`bookSourceGroup`、`bookSourceComment` | `url`、`name`、`group`、`comment` |
 | `bookSourceType`（0 / 1 / 2） | `type`：`text`、`audio`、`comic` |
-| `header` | `headers`（JSON 对象） |
+| `header` | `headers`（JSON 对象）；`@js:` 动态请求头改成值里的 `=` 表达式或 `{{ }}` 模板，每次请求时求值 |
 | `concurrentRate` | `rate` |
 | `searchUrl` 里的 `{{key}}`、`{{page}}` | `search.url` 里的 `{{urlencode(key)}}`、`{{page}}`；`key` 是未编码的原文 |
 | URL 后的 `,{"method":"POST","body":…}` | 阶段的 `method`、`body`、`headers`、`charset`、`retry`、`webView` |
